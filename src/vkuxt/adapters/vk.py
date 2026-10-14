@@ -12,10 +12,10 @@ from pydantic import BaseModel
 
 from ..app import Adapter, AdapterInput, App, EventMetadata
 from ..codec import decode_key, encode_key
-from ..mounts import InterfaceDraft
+from ..interfaces import InterfaceDraft
 
 
-class VKMessageMountId(BaseModel):
+class VKMessageInterfaceId(BaseModel):
     cmid: int
     peer_id: int
     group_id: int
@@ -25,15 +25,11 @@ class VKMessageMetadata(EventMetadata):
     """Метаданные входящего сообщения VK."""
 
     group_id: int
-    chat_id: int
+    peer_id: int
     user_id: int
     cmid: int | None = None
     event_id: str | None = None
-    interface_id: VKMessageMountId | None = None
-
-    @property
-    def peer_id(self) -> int:
-        return self.chat_id
+    interface_id: VKMessageInterfaceId | None = None
 
 
 class VKMessagesAdapter(Adapter, ABC):
@@ -57,7 +53,7 @@ class VKMessagesAdapter(Adapter, ABC):
         interface: InterfaceDraft,
         *,
         keyboard: Any = None,
-    ) -> VKMessageMountId:
+    ) -> VKMessageInterfaceId:
         response = await self.vk.messages.send(
             peer_ids=[peer_id],
             random_id=secrets.randbelow(2**31),
@@ -74,14 +70,14 @@ class VKMessagesAdapter(Adapter, ABC):
             ) from exc
         if cmid is None:
             raise RuntimeError("VK вернул ответ без conversation_message_id")
-        interface_id = VKMessageMountId(cmid=int(cmid), peer_id=peer_id, group_id=self.group_id)
+        interface_id = VKMessageInterfaceId(cmid=int(cmid), peer_id=peer_id, group_id=self.group_id)
         await self.app.register_interface(interface_id, interface)
         await self._remember_interface(interface_id)
         return interface_id
 
     async def edit(
         self,
-        interface_id: VKMessageMountId,
+        interface_id: VKMessageInterfaceId,
         text: str,
         interface: InterfaceDraft,
         *,
@@ -100,7 +96,7 @@ class VKMessagesAdapter(Adapter, ABC):
             await self._remember_interface(interface_id)
         return bool(changed)
 
-    async def delete(self, interface_id: VKMessageMountId) -> bool:
+    async def delete(self, interface_id: VKMessageInterfaceId) -> bool:
         response = await self.vk.messages.delete(
             cmids=[interface_id.cmid],
             peer_id=interface_id.peer_id,
@@ -112,7 +108,7 @@ class VKMessagesAdapter(Adapter, ABC):
         self._mark_current_interface(interface_id)
         return bool(response)
 
-    async def _remember_interface(self, interface_id: VKMessageMountId) -> None:
+    async def _remember_interface(self, interface_id: VKMessageInterfaceId) -> None:
         index_key = _peer_index_key(interface_id.group_id, interface_id.peer_id)
         encoded = encode_key(interface_id)
         async with self._peer_lock:
@@ -127,7 +123,7 @@ class VKMessagesAdapter(Adapter, ABC):
             active.append(encoded)
             await self.app.storage.set(index_key, _json(active))
 
-    async def _forget_interface(self, interface_id: VKMessageMountId) -> None:
+    async def _forget_interface(self, interface_id: VKMessageInterfaceId) -> None:
         index_key = _peer_index_key(interface_id.group_id, interface_id.peer_id)
         async with self._peer_lock:
             raw = await self.app.storage.get(index_key)
@@ -142,7 +138,7 @@ class VKMessagesAdapter(Adapter, ABC):
                 else:
                     await self.app.storage.delete(index_key)
 
-    async def _latest_interface(self, peer_id: int) -> VKMessageMountId | None:
+    async def _latest_interface(self, peer_id: int) -> VKMessageInterfaceId | None:
         index_key = _peer_index_key(self.group_id, peer_id)
         async with self._peer_lock:
             raw = await self.app.storage.get(index_key)
@@ -162,7 +158,7 @@ class VKMessagesAdapter(Adapter, ABC):
                 await self.app.storage.delete(index_key)
             return latest
 
-    def _mark_current_interface(self, interface_id: VKMessageMountId) -> None:
+    def _mark_current_interface(self, interface_id: VKMessageInterfaceId) -> None:
         return None
 
 
@@ -177,7 +173,7 @@ class VKCallbackAdapter(Adapter, ABC):
         callback_server: Any | None = None,
         confirmation_code: str | None = None,
         secret: str | None = None,
-        dm_latest_mount: bool = True,
+        dm_latest_interface: bool = True,
     ) -> None:
         if callback_server is None:
             try:
@@ -193,8 +189,8 @@ class VKCallbackAdapter(Adapter, ABC):
         self.group_id = group_id
         self.callback_server = callback_server
         self.confirmation_code = confirmation_code
-        self.dm_latest_mount = dm_latest_mount
-        self._callback_mount: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+        self.dm_latest_interface = dm_latest_interface
+        self._callback_interface: contextvars.ContextVar[str | None] = contextvars.ContextVar(
             f"vkuxt_vk_mount_{id(self)}", default=None
         )
         self._callback_changed: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -253,13 +249,13 @@ class VKCallbackAdapter(Adapter, ABC):
             return AdapterInput(None, None)
 
         interface_id = (
-            VKMessageMountId(cmid=int(cmid), peer_id=int(peer_id), group_id=self.group_id)
+            VKMessageInterfaceId(cmid=int(cmid), peer_id=int(peer_id), group_id=self.group_id)
             if cmid is not None
             else None
         )
         metadata = VKMessageMetadata(
             group_id=self.group_id,
-            chat_id=int(peer_id),
+            peer_id=int(peer_id),
             user_id=int(user_id),
             cmid=int(cmid) if cmid is not None else None,
             event_id=str(event_id),
@@ -298,14 +294,14 @@ class VKCallbackAdapter(Adapter, ABC):
         reply_cmid = getattr(reply, "conversation_message_id", None)
         interface_id = None
         if reply_cmid is not None:
-            interface_id = VKMessageMountId(
+            interface_id = VKMessageInterfaceId(
                 cmid=int(reply_cmid), peer_id=peer_id, group_id=self.group_id
             )
-        elif self.dm_latest_mount and peer_id == user_id:
+        elif self.dm_latest_interface and peer_id == user_id:
             interface_id = await self._latest_interface(peer_id)
         metadata = VKMessageMetadata(
             group_id=self.group_id,
-            chat_id=peer_id,
+            peer_id=peer_id,
             user_id=user_id,
             cmid=int(cmid) if cmid is not None else None,
             interface_id=interface_id,
@@ -316,7 +312,7 @@ class VKCallbackAdapter(Adapter, ABC):
         if not event.acknowledge or not isinstance(event.metadata, VKMessageMetadata):
             return await super().dispatch_input(event)
         metadata = event.metadata
-        mount_token = self._callback_mount.set(
+        mount_token = self._callback_interface.set(
             encode_key(metadata.interface_id) if metadata.interface_id is not None else None
         )
         changed_token = self._callback_changed.set(False)
@@ -328,15 +324,15 @@ class VKCallbackAdapter(Adapter, ABC):
                 if not changed and metadata.event_id is not None:
                     await self._answer_callback(
                         metadata.event_id,
-                        metadata.chat_id,
+                        metadata.peer_id,
                         metadata.user_id,
                     )
             finally:
                 self._callback_changed.reset(changed_token)
-                self._callback_mount.reset(mount_token)
+                self._callback_interface.reset(mount_token)
 
-    def _mark_current_interface(self, interface_id: VKMessageMountId) -> None:
-        if self._callback_mount.get() == encode_key(interface_id):
+    def _mark_current_interface(self, interface_id: VKMessageInterfaceId) -> None:
+        if self._callback_interface.get() == encode_key(interface_id):
             self._callback_changed.set(True)
 
     @abstractmethod
@@ -344,7 +340,7 @@ class VKCallbackAdapter(Adapter, ABC):
         """Завершить обработку callback-события средствами VK Messages."""
 
     @abstractmethod
-    async def _latest_interface(self, peer_id: int) -> VKMessageMountId | None:
+    async def _latest_interface(self, peer_id: int) -> VKMessageInterfaceId | None:
         """Найти последний активный интерфейс в личном диалоге."""
 
 
@@ -360,17 +356,12 @@ class VKMessagesCallbackAdapter(VKCallbackAdapter, VKMessagesAdapter):
         callback_server: Any | None = None,
         confirmation_code: str | None = None,
         secret: str | None = None,
-        dm_latest_mount: bool = True,
+        dm_latest_interface: bool = True,
     ) -> None:
         VKMessagesAdapter.__init__(self, app, vk, group_id)
         VKCallbackAdapter.__init__(
-            self,
-            app,
-            group_id,
-            callback_server=callback_server,
-            confirmation_code=confirmation_code,
-            secret=secret,
-            dm_latest_mount=dm_latest_mount,
+            self, app, group_id, callback_server=callback_server, confirmation_code=confirmation_code,
+            secret=secret,dm_latest_interface=dm_latest_interface
         )
 
     @property
@@ -384,7 +375,7 @@ class VKMessagesCallbackAdapter(VKCallbackAdapter, VKMessagesAdapter):
             user_id=user_id,
         )
 
-    async def _latest_interface(self, peer_id: int) -> VKMessageMountId | None:
+    async def _latest_interface(self, peer_id: int) -> VKMessageInterfaceId | None:
         return await VKMessagesAdapter._latest_interface(self, peer_id)
 
 
@@ -428,8 +419,8 @@ def _peer_index_key(group_id: int, peer_id: int) -> str:
     return f"vkuxt:vk-peer-interfaces:{group_id}:{peer_id}"
 
 
-def _decode_interface_id(encoded: str) -> VKMessageMountId:
-    return decode_key(encoded, VKMessageMountId)
+def _decode_interface_id(encoded: str) -> VKMessageInterfaceId:
+    return decode_key(encoded, VKMessageInterfaceId)
 
 
 def _json(value: Any) -> str:

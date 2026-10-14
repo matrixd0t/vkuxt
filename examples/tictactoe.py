@@ -14,7 +14,7 @@ from vkuxt import (
     InputModel,
     JSONFileStorage,
     VKMessageMetadata,
-    VKMessageMountId,
+    VKMessageInterfaceId,
     VKMessagesCallbackAdapter,
 )
 
@@ -84,7 +84,7 @@ class TicTacToeBot:
         @self.app.handler
         async def menu(app: App, meta: VKMessageMetadata, input: str) -> None:
             if input.strip().casefold() in {"начать", "меню"}:
-                await self._show_menu(meta.chat_id, meta.user_id)
+                await self._show_menu(meta.peer_id, meta.user_id)
 
         @self.app.handler
         async def create_lobby(
@@ -156,7 +156,7 @@ class TicTacToeBot:
         self,
         peer_id: int,
         user_id: int,
-        interface_id: VKMessageMountId | None = None,
+        interface_id: VKMessageInterfaceId | None = None,
     ) -> None:
         draft = self.app.new_interface()
         create_payload = draft.bind(
@@ -209,7 +209,7 @@ class TicTacToeBot:
                     continue
                 owner = Participant(
                     user_id=metadata.user_id,
-                    peer_id=metadata.chat_id,
+                    peer_id=metadata.peer_id,
                     interface_id=interface_id.model_dump(mode="json"),
                 )
                 await self.app.set_state(
@@ -220,7 +220,7 @@ class TicTacToeBot:
                 return
         raise RuntimeError("Не удалось подобрать свободный код игры")  # noqa: RUF001
 
-    async def _render_lobby(self, interface_id: VKMessageMountId, code: str) -> None:
+    async def _render_lobby(self, interface_id: VKMessageInterfaceId, code: str) -> None:
         draft = self.app.new_interface()
         payload = draft.bind(
             LobbyActionInput(handler_name="ttt.abandon_lobby", code=code)
@@ -245,7 +245,7 @@ class TicTacToeBot:
 
     async def _render_join_prompt(
         self,
-        interface_id: VKMessageMountId,
+        interface_id: VKMessageInterfaceId,
         owner_id: int,
     ) -> None:
         draft = self.app.new_interface()
@@ -293,7 +293,7 @@ class TicTacToeBot:
 
             joiner = Participant(
                 user_id=metadata.user_id,
-                peer_id=metadata.chat_id,
+                peer_id=metadata.peer_id,
                 interface_id=interface_id.model_dump(mode="json"),
             )
             players = [lobby["owner"], joiner.model_dump(mode="json")]
@@ -395,7 +395,7 @@ class TicTacToeBot:
             or metadata.interface_id is None
         ):
             return
-        await self._show_menu(metadata.chat_id, metadata.user_id, metadata.interface_id)
+        await self._show_menu(metadata.peer_id, metadata.user_id, metadata.interface_id)
 
     def _authorized_turn(
         self,
@@ -435,14 +435,14 @@ class TicTacToeBot:
         return (
             metadata.interface_id is not None
             and player["user_id"] == metadata.user_id
-            and player["peer_id"] == metadata.chat_id
+            and player["peer_id"] == metadata.peer_id
             and _stored_interface_id(player) == metadata.interface_id.model_dump(mode="json")
         )
 
     async def _render_game(self, group_id: int, game: dict[str, Any]) -> None:
         board_text = _board_text(game["board"])
         for seat, player in enumerate(game["players"]):
-            interface_id = VKMessageMountId.model_validate(_stored_interface_id(player))
+            interface_id = VKMessageInterfaceId.model_validate(_stored_interface_id(player))
             draft = self.app.new_interface()
             if game["status"] == "active":
                 rows: list[list[KeyboardButton]] = []
@@ -557,7 +557,7 @@ def attach_fastapi(app: App):
 def _is_owner(owner: dict[str, Any], metadata: VKMessageMetadata) -> bool:
     return (
         owner["user_id"] == metadata.user_id
-        and owner["peer_id"] == metadata.chat_id
+        and owner["peer_id"] == metadata.peer_id
         and metadata.interface_id is not None
         and _stored_interface_id(owner) == metadata.interface_id.model_dump(mode="json")
     )

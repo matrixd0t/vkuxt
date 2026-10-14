@@ -1,15 +1,15 @@
 from .vk import (
     VKCallbackAdapter,
+    VKMessageInterfaceId,
     VKMessageMetadata,
-    VKMessageMountId,
     VKMessagesAdapter,
     VKMessagesCallbackAdapter,
 )
 
 __all__ = [
     "VKCallbackAdapter",
+    "VKMessageInterfaceId",
     "VKMessageMetadata",
-    "VKMessageMountId",
     "VKMessagesAdapter",
     "VKMessagesCallbackAdapter",
 ]

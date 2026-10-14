@@ -13,7 +13,7 @@ from vkuxt import (
     MemoryStorage,
     VKCallbackAdapter,
     VKMessageMetadata,
-    VKMessageMountId,
+    VKMessageInterfaceId,
     VKMessagesAdapter,
     VKMessagesCallbackAdapter,
 )
@@ -73,7 +73,7 @@ def test_send_registers_the_vk_external_mount_id() -> None:
         adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
         assert isinstance(adapter.callback_server, CallbackServer)
         interface_id = await adapter.send(2000000001, "hello", app.new_interface())
-        assert interface_id == VKMessageMountId(cmid=91, peer_id=2000000001, group_id=71)
+        assert interface_id == VKMessageInterfaceId(cmid=91, peer_id=2000000001, group_id=71)
         assert await app.get_interface(interface_id) is not None
         assert vk.messages.sent[0]["peer_ids"] == [interface_id.peer_id]
         await app.close()
@@ -143,7 +143,7 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
         assert received[-1][1] is None
         assert isinstance(received[-1][2], StartInput)
         assert received[-1][2].source == "button"
-        assert received[-1][0].chat_id == 2000000001
+        assert received[-1][0].peer_id == 2000000001
         assert received[-1][0].group_id == 71
         assert received[-1][0].user_id == 5
         assert isinstance(logged[-1][1], InputData)
@@ -170,7 +170,7 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
         assert await app.handle_input(message) == "ok"
         assert received[-1][1] == "начать"
         assert received[-1][2] is None
-        assert received[-1][0].chat_id == 5
+        assert received[-1][0].peer_id == 5
         assert logged[-1] == ("начать", None)
         await app.close()
 
@@ -243,7 +243,7 @@ def test_callback_ack_is_skipped_when_pressed_interface_is_edited() -> None:
                 keyboard='{"buttons":[]}',
             )
 
-        message_id = VKMessageMountId(cmid=10, peer_id=2000000001, group_id=71)
+        message_id = VKMessageInterfaceId(cmid=10, peer_id=2000000001, group_id=71)
         payload = {
             "type": "message_event",
             "group_id": 71,

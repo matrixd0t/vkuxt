@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from .codec import storage_key
 from .locks import KeyedLockPool
-from .mounts import DEFAULT_TTL, InterfaceDraft, InterfaceRecord, TTLValue, _DefaultTTL
+from .interfaces import DEFAULT_TTL, InterfaceDraft, InterfaceRecord, TTLValue, _DefaultTTL
 from .storage import MemoryStorage, StateStorage
 
 InputT = TypeVar("InputT", bound="InputModel")
