@@ -54,26 +54,26 @@ class InputData(StructuredInput):
     model_config = ConfigDict(extra="allow", validate_assignment=True)
 
 
-class EventMetadata(InputModel):
+class InputMetadata(InputModel):
     """Метаданные события, специфичные для адаптера."""
 
 
 @dataclass(frozen=True, slots=True, init=False)
 class Input:
-    metadata: EventMetadata
+    metadata: InputMetadata
     data: InputData | None
     text: str | None
-    acknowledge: bool = False
+    interface_id: Any | None
 
     def __init__(
         self,
-        metadata: EventMetadata,
+        metadata: InputMetadata,
         data: InputData | Mapping[str, Any] | None = None,
         text: str | None = None,
-        acknowledge: bool = False,
+        interface_id: Any | None = None,
     ) -> None:
-        if not isinstance(metadata, EventMetadata):
-            raise TypeError("metadata должен быть EventMetadata")
+        if not isinstance(metadata, InputMetadata):
+            raise TypeError("metadata должен быть InputMetadata")
         if isinstance(data, Mapping):
             data = InputData.model_validate(data)
         elif data is not None and not isinstance(data, InputData):
@@ -83,7 +83,7 @@ class Input:
         object.__setattr__(self, "metadata", metadata)
         object.__setattr__(self, "data", data)
         object.__setattr__(self, "text", text)
-        object.__setattr__(self, "acknowledge", acknowledge)
+        object.__setattr__(self, "interface_id", interface_id)
 
 
 class Adapter:
@@ -134,16 +134,14 @@ class App:
         self.services: dict[str, Any] = {}
         self._adapters: list[Adapter] = []
         self._started_adapters: list[Adapter] = []
+        self._adapter_start_tasks: set[asyncio.Task[None]] = set()
+        self._adapter_start_lock = asyncio.Lock()
         self._running = False
-        cleanup = getattr(self.storage, "cleanup_expired", None)
-        self._cleanup_task = (
-            self.planner.task(
-                every("1m"),
-                name=f"vkuxt-storage-cleanup-{id(self)}",
-            )(cleanup)
-            if cleanup is not None
-            else None
-        )
+        self._closing = False
+        self._cleanup_task = self.planner.task(
+            every("1m"),
+            name=f"vkuxt-storage-cleanup-{id(self)}",
+        )(self.storage.cleanup_expired)
 
     @property
     def adapters(self) -> tuple[Adapter, ...]:
@@ -162,21 +160,25 @@ class App:
         *args: Any,
         **kwargs: Any,
     ) -> AdapterT:
+        if self._closing:
+            raise RuntimeError("Нельзя добавлять адаптер во время остановки приложения")
+        loop = None
         if self._running:
-            raise RuntimeError("Нельзя добавлять адаптер после запуска приложения")
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Добавление адаптера во время работы требует активного event loop"
+                ) from exc
         adapter = adapter_type(self, *args, **kwargs)
         self._adapters.append(adapter)
+        if loop is not None:
+            task = loop.create_task(self._start_adapter(adapter))
+            self._adapter_start_tasks.add(task)
+            task.add_done_callback(self._adapter_start_done)
         return adapter
 
     def add_handler(self, function: Handler, *, background: bool = True) -> Handler:
-        signature = inspect.signature(function)
-        parameters = tuple(signature.parameters.values())
-        parameter_names = tuple(parameter.name for parameter in parameters)
-        if parameter_names != ("app", "input") or any(
-            parameter.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD for parameter in parameters
-        ):
-            raise TypeError("Handler signature must be (app, input)")
-
         self._handlers.append(_HandlerEntry(background, function))
         return function
 
@@ -184,40 +186,50 @@ class App:
     def handler(self, function: Handler, *, background: bool = True) -> Handler: ...
 
     @overload
-    def handler(
-        self,
-        function: None = None,
-        *,
-        background: bool = True,
-    ) -> Callable[[Handler], Handler]: ...
+    def handler(self, function: None = None, *, background: bool = True) -> Callable[[Handler], Handler]: ...
 
-    def handler(
-        self,
-        function: Handler | None = None,
-        *,
-        background: bool = True,
-    ) -> Handler | Callable[[Handler], Handler]:
+    def handler(self, function: Handler | None = None, *, background: bool = True) -> Handler | Callable[[Handler], Handler]:
         if function is None:
             return lambda registered: self.add_handler(registered, background=background)
         return self.add_handler(function, background=background)
 
-    async def dispatch_event(
-        self,
-        input: Input,
-    ) -> Any:
-        results: list[Any] = []
-        for entry in tuple(self._handlers):
-            if entry.background:
-                task = asyncio.create_task(self._invoke(entry, input))
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_task_done)
-            else:
-                result = await self._invoke(entry, input)
+    async def dispatch_event(self, _input: Input) -> Any:
+        entries = tuple(self._handlers)
+        for entry in entries:
+            if not entry.background:
+                try:
+                    result = await self._invoke(entry, _input)
+                except StopIteration:
+                    break
+                except RuntimeError as exc:
+                    # PEP 479 wraps StopIteration raised inside async handlers.
+                    if isinstance(exc.__cause__, StopIteration):
+                        break
+                    raise
                 if result is not None:
-                    results.append(result)
-        if not results:
-            return None
-        return results[0] if len(results) == 1 else results
+                    return result
+
+        background_entries = tuple(entry for entry in entries if entry.background)
+        if background_entries:
+            task = asyncio.create_task(self._run_background_handlers(background_entries, _input))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_task_done)
+        return None
+
+    async def _run_background_handlers(
+        self,
+        entries: tuple[_HandlerEntry, ...],
+        _input: Input,
+    ) -> None:
+        for entry in entries:
+            try:
+                await self._invoke(entry, _input)
+            except StopIteration:
+                return
+            except RuntimeError as exc:
+                if isinstance(exc.__cause__, StopIteration):
+                    return
+                raise
 
     def _background_task_done(self, task: asyncio.Task[Any]) -> None:
         self._background_tasks.discard(task)
@@ -228,12 +240,30 @@ class App:
                 {"message": "Background input handler failed", "exception": exception, "task": task}
             )
 
-    async def _invoke(
-        self,
-        entry: _HandlerEntry,
-        input: Input,
-    ) -> Any:
-        result = entry.function(self, input)
+    def _adapter_start_done(self, task: asyncio.Task[None]) -> None:
+        self._adapter_start_tasks.discard(task)
+        if task.cancelled():
+            return
+        if exception := task.exception():
+            task.get_loop().call_exception_handler(
+                {"message": "Adapter startup failed", "exception": exception, "task": task}
+            )
+
+    async def _start_adapter(self, adapter: Adapter) -> None:
+        async with self._adapter_start_lock:
+            if adapter in self._started_adapters:
+                return
+            self._started_adapters.append(adapter)
+            await adapter.start()
+
+    async def _wait_for_adapter_starts(self) -> None:
+        while self._adapter_start_tasks:
+            tasks = tuple(self._adapter_start_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._adapter_start_tasks.difference_update(tasks)
+
+    async def _invoke(self, entry: _HandlerEntry, _input: Input) -> Any:
+        result = entry.function(self, _input)
         return await result if inspect.isawaitable(result) else result
 
     async def handle_input(self, raw: str | bytes | Mapping[str, Any]) -> Any:
@@ -243,11 +273,7 @@ class App:
                 return await adapter.dispatch_input(event)
         return None
 
-    def new_interface(
-        self,
-        *,
-        ttl: TTLValue = DEFAULT_TTL,
-    ) -> Interface:
+    def new_interface(self, *, ttl: TTLValue = DEFAULT_TTL) -> Interface:
         return Interface(ttl=ttl, tokenize_long_input=self.tokenize_long_input)
 
     async def register_interface(self, external_id: Any, interface: Interface) -> None:
@@ -307,52 +333,61 @@ class App:
         return self._locks.lock(*keys)
 
     async def start(self) -> None:
+        if self._closing:
+            raise RuntimeError("Нельзя запустить приложение во время остановки")
         if self._running:
             return
+        adapters = tuple(self._adapters)
         self._running = True
         try:
-            if self._owns_planner and self._cleanup_task is not None:
+            if self._owns_planner:
                 await self.planner.start()
-            for adapter in self._adapters:
-                self._started_adapters.append(adapter)
-                await adapter.start()
+            for adapter in adapters:
+                await self._start_adapter(adapter)
         except (Exception, asyncio.CancelledError) as startup_error:
             try:
+                await self._wait_for_adapter_starts()
                 await self._stop_adapters()
             except (Exception, asyncio.CancelledError) as close_error:  # noqa: BLE001
                 startup_error.add_note(
                     f"Ошибка остановки адаптера после сбоя запуска: {close_error!r}"
                 )
             finally:
-                if self._cleanup_task is not None:
-                    try:
-                        if self._owns_planner:
-                            await self.planner.stop()
-                        else:
-                            await self.planner.remove(self._cleanup_task.task_id)
-                    except (Exception, asyncio.CancelledError) as planner_error:  # noqa: BLE001
-                        startup_error.add_note(
-                            f"Ошибка остановки planner после сбоя запуска: {planner_error!r}"
-                        )
+                try:
+                    if self._owns_planner:
+                        await self.planner.stop()
+                    else:
+                        await self.planner.remove(self._cleanup_task.task_id)
+                except (Exception, asyncio.CancelledError) as planner_error:  # noqa: BLE001
+                    startup_error.add_note(
+                        f"Ошибка остановки planner после сбоя запуска: {planner_error!r}"
+                    )
                 self._running = False
             raise
 
     async def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self._running = False
         try:
-            await self._stop_adapters()
-        finally:
             try:
-                while self._background_tasks:
-                    await asyncio.gather(*tuple(self._background_tasks), return_exceptions=True)
+                await self._wait_for_adapter_starts()
+                await self._stop_adapters()
             finally:
                 try:
-                    if self._cleanup_task is not None:
-                        if self._owns_planner:
-                            await self.planner.stop()
-                        else:
-                            await self.planner.remove(self._cleanup_task.task_id)
+                    while self._background_tasks:
+                        await asyncio.gather(
+                            *tuple(self._background_tasks), return_exceptions=True
+                        )
                 finally:
-                    self._running = False
+                    if self._owns_planner:
+                        await self.planner.stop()
+                    else:
+                        await self.planner.remove(self._cleanup_task.task_id)
+        finally:
+            self._running = False
+            self._closing = False
 
     async def _stop_adapters(self) -> None:
         shutdown_error: BaseException | None = None

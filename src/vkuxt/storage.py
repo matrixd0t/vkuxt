@@ -23,6 +23,8 @@ class StateStorage(Protocol):
 
     async def delete(self, key: str) -> None: ...
 
+    async def cleanup_expired(self) -> None: ...
+
 
 class MemoryStorage:
     def __init__(self) -> None:
@@ -160,6 +162,9 @@ class RedisStorage:
 
     async def delete(self, key: str) -> None:
         await self.client.delete(key)  # type: ignore[attr-defined]
+
+    async def cleanup_expired(self) -> None:
+        """Redis expires keys using native TTLs."""
 
     async def scan(self, prefix: str) -> list[StorageItem]:
         result: list[StorageItem] = []

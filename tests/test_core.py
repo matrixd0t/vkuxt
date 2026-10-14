@@ -10,9 +10,9 @@ from starlette.applications import Starlette
 from vkuxt import (
     Adapter,
     App,
-    EventMetadata,
     Input,
     InputData,
+    InputMetadata,
     JSONFileStorage,
     MemoryStorage,
     decode_key,
@@ -26,7 +26,7 @@ class AccountKey(BaseModel):
     scope: str
 
 
-class EchoMetadata(EventMetadata):
+class EchoMetadata(InputMetadata):
     user_id: int
 
 
@@ -112,12 +112,10 @@ def test_handlers_receive_input_data_and_long_payload_tokens_persist(tmp_path) -
         record = await restored.get_interface(interface_id)
         assert record is not None
         assert old_token not in record.actions
-        await restored.dispatch_event(
-            Input(
-                EchoMetadata(user_id=4),
-                data=record.actions[new_token]["data"],
-            )
-        )
+        await restored.dispatch_event(Input(
+            EchoMetadata(user_id=4),
+            data=record.actions[new_token]["data"],
+        ))
         assert calls[-1].text == "current"
         await restored.close()
 
@@ -212,12 +210,16 @@ def test_app_owns_adapter_lifecycle_through_starlette_lifespan() -> None:
         async with web.router.lifespan_context(web):
             assert app.adapters == (first, second)
             assert calls == ["start:first", "start:second"]
-            with pytest.raises(RuntimeError, match="после запуска"):
-                app.add_adapter(RecordingAdapter, calls, "late")
+            late = app.add_adapter(RecordingAdapter, calls, "late")
+            assert late in app.adapters
+            await asyncio.sleep(0)
+            assert calls == ["start:first", "start:second", "start:late"]
 
         assert calls == [
             "start:first",
             "start:second",
+            "start:late",
+            "close:late",
             "close:second",
             "close:first",
         ]
@@ -226,7 +228,7 @@ def test_app_owns_adapter_lifecycle_through_starlette_lifespan() -> None:
 
 
 def test_raw_input_tries_adapters_in_order_and_passes_input_to_handlers() -> None:
-    class OtherMetadata(EventMetadata):
+    class OtherMetadata(InputMetadata):
         pass
 
     class ParserAdapter(Adapter):
@@ -258,7 +260,7 @@ def test_raw_input_tries_adapters_in_order_and_passes_input_to_handlers() -> Non
         app.add_adapter(ParserAdapter, "third", parser_calls, True)
 
         @app.handler(background=False)
-        async def echo(app: App, input: Input) -> str:
+        async def echo(app: App, input: Input) -> str | None:
             if (
                 isinstance(input.metadata, EchoMetadata)
                 and input.data is not None
@@ -273,7 +275,7 @@ def test_raw_input_tries_adapters_in_order_and_passes_input_to_handlers() -> Non
                 )
                 seen_by_echo.append(input)
                 return "ok"
-            return "ignored"
+            return None
 
         @app.handler(background=False)
         async def other(app: App, input: object) -> None:
@@ -285,11 +287,108 @@ def test_raw_input_tries_adapters_in_order_and_passes_input_to_handlers() -> Non
         assert await app.handle_input({"text": "hello"}) == "ok"
         assert parser_calls == ["first", "second"]
         assert received == [(9, "hello", "payload")]
-        assert seen_by_echo[0] is seen_by_other[0]
-        assert await app.dispatch_event(Input(OtherMetadata())) == "ignored"
+        assert seen_by_other == []
+        assert await app.dispatch_event(Input(OtherMetadata())) is None
         assert len(other_metadata) == 1
-        assert seen_by_other[1].metadata is other_metadata[0]
+        assert seen_by_other[0].metadata is other_metadata[0]
         await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_add_handler_does_not_validate_handler_signature() -> None:
+    async def scenario() -> None:
+        app = App()
+        received: list[object] = []
+
+        def handler(*args: object) -> None:
+            received.extend(args)
+
+        event = Input(EchoMetadata(user_id=1))
+        app.add_handler(handler, background=False)
+        await app.dispatch_event(event)
+        assert received == [app, event]
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_foreground_handlers_short_circuit_before_background_handlers() -> None:
+    async def scenario() -> None:
+        app = App()
+        calls: list[str] = []
+
+        @app.handler(background=True)
+        async def background(app: App, input: Input) -> None:
+            calls.append("background")
+
+        @app.handler(background=False)
+        async def first(app: App, input: Input) -> None:
+            calls.append("first")
+
+        @app.handler(background=False)
+        async def second(app: App, input: Input) -> str:
+            calls.append("second")
+            return "handled"
+
+        @app.handler(background=False)
+        async def third(app: App, input: Input) -> None:
+            calls.append("third")
+
+        assert await app.dispatch_event(Input(EchoMetadata(user_id=1))) == "handled"
+        assert calls == ["first", "second"]
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_background_handlers_run_sequentially_and_stop_iteration_stops_them() -> None:
+    async def scenario() -> None:
+        app = App()
+        calls: list[str] = []
+
+        @app.handler(background=False)
+        async def foreground(app: App, input: Input) -> None:
+            calls.append("foreground")
+
+        @app.handler(background=True)
+        async def first(app: App, input: Input) -> None:
+            calls.append("first")
+
+        @app.handler(background=True)
+        async def stop(app: App, input: Input) -> None:
+            calls.append("stop")
+            raise StopIteration
+
+        @app.handler(background=True)
+        async def last(app: App, input: Input) -> None:
+            calls.append("last")
+
+        assert await app.dispatch_event(Input(EchoMetadata(user_id=1))) is None
+        assert calls == ["foreground"]
+        await app.close()
+        assert calls == ["foreground", "first", "stop"]
+
+        stopped_app = App()
+        stopped_calls: list[str] = []
+
+        @stopped_app.handler(background=False)
+        async def stop_foreground(app: App, input: Input) -> None:
+            stopped_calls.append("stop")
+            raise StopIteration
+
+        @stopped_app.handler(background=False)
+        async def skipped_foreground(app: App, input: Input) -> None:
+            stopped_calls.append("skipped")
+
+        @stopped_app.handler(background=True)
+        async def background_after_stop(app: App, input: Input) -> None:
+            stopped_calls.append("background")
+
+        assert await stopped_app.dispatch_event(Input(EchoMetadata(user_id=2))) is None
+        assert stopped_calls == ["stop"]
+        await stopped_app.close()
+        assert stopped_calls == ["stop", "background"]
 
     asyncio.run(scenario())
 

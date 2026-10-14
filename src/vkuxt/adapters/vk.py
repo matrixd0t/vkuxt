@@ -6,11 +6,11 @@ import json
 import secrets
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from ..app import Adapter, App, EventMetadata, Input
+from ..app import Adapter, App, Input, InputMetadata
 from ..codec import decode_key, encode_key
 from ..interfaces import Interface
 
@@ -21,18 +21,18 @@ class VKMessageInterfaceId(BaseModel):
     group_id: int
 
 
-class VKMessageMetadata(EventMetadata):
+class VKMessageMetadata(InputMetadata):
     """Метаданные входящего сообщения VK."""
 
+    event_type: Literal["message_event", "message_new"]
     group_id: int
     peer_id: int
     user_id: int
     cmid: int | None = None
     event_id: str | None = None
-    interface_id: VKMessageInterfaceId | None = None
 
 
-class _VKConfirmationMetadata(EventMetadata):
+class _VKConfirmationMetadata(InputMetadata):
     group_id: int
 
 
@@ -260,18 +260,24 @@ class VKCallbackAdapter(Adapter, ABC):
         if peer_id is None or user_id is None or event_id is None:
             return None
 
-        interface_id = (
+        candidate_interface_id = (
             VKMessageInterfaceId(cmid=int(cmid), peer_id=int(peer_id), group_id=self.group_id)
             if cmid is not None
             else None
         )
+        interface_record = (
+            await self.app.get_interface(candidate_interface_id)
+            if candidate_interface_id is not None
+            else None
+        )
+        interface_id = candidate_interface_id if interface_record is not None else None
         metadata = VKMessageMetadata(
+            event_type="message_event",
             group_id=self.group_id,
             peer_id=int(peer_id),
             user_id=int(user_id),
             cmid=int(cmid) if cmid is not None else None,
             event_id=str(event_id),
-            interface_id=interface_id,
         )
         action_data = None
         if isinstance(payload, str):
@@ -284,15 +290,14 @@ class VKCallbackAdapter(Adapter, ABC):
                     payload = decoded_payload
         if isinstance(payload, Mapping):
             action_data = payload
-        elif isinstance(payload, str) and interface_id is not None:
-            record = await self.app.get_interface(interface_id)
-            action = record.actions.get(payload) if record is not None else None
+        elif isinstance(payload, str) and interface_record is not None:
+            action = interface_record.actions.get(payload)
             if action is not None:
                 action_data = action.get("data")
         return Input(
             metadata,
             data=action_data,
-            acknowledge=True,
+            interface_id=interface_id,
         )
 
     async def _parse_message_new(self, event: Any) -> Input | None:
@@ -306,26 +311,31 @@ class VKCallbackAdapter(Adapter, ABC):
         reply_cmid = getattr(reply, "conversation_message_id", None)
         interface_id = None
         if reply_cmid is not None:
-            interface_id = VKMessageInterfaceId(
+            candidate_interface_id = VKMessageInterfaceId(
                 cmid=int(reply_cmid), peer_id=peer_id, group_id=self.group_id
             )
+            if await self.app.get_interface(candidate_interface_id) is not None:
+                interface_id = candidate_interface_id
         elif self.dm_latest_interface and peer_id == user_id:
             interface_id = await self._latest_interface(peer_id)
         metadata = VKMessageMetadata(
+            event_type="message_new",
             group_id=self.group_id,
             peer_id=peer_id,
             user_id=user_id,
             cmid=int(cmid) if cmid is not None else None,
-            interface_id=interface_id,
         )
-        return Input(metadata, text=message.text or "")
+        return Input(metadata, text=message.text or "", interface_id=interface_id)
 
     async def dispatch_input(self, event: Input) -> Any:
-        if not event.acknowledge or not isinstance(event.metadata, VKMessageMetadata):
+        if (
+            not isinstance(event.metadata, VKMessageMetadata)
+            or event.metadata.event_type != "message_event"
+        ):
             return await super().dispatch_input(event)
         metadata = event.metadata
         mount_token = self._callback_interface.set(
-            encode_key(metadata.interface_id) if metadata.interface_id is not None else None
+            encode_key(event.interface_id) if event.interface_id is not None else None
         )
         changed_token = self._callback_changed.set(False)
         try:

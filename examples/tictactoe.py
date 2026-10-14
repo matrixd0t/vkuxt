@@ -88,7 +88,12 @@ class TicTacToeBot:
                 and input.text is not None
                 and input.text.strip().casefold() in {"начать", "меню"}
             ):
-                await self._show_menu(app, meta.peer_id, meta.user_id)
+                await self._show_menu(
+                    app,
+                    meta.peer_id,
+                    meta.user_id,
+                    _vk_interface_id(input),
+                )
 
         @app.handler(background=False)
         async def create_lobby(app: App, input: Input) -> None:
@@ -96,7 +101,7 @@ class TicTacToeBot:
             data = _typed_data(input, CreateLobbyInput)
             if meta is None or data is None:
                 return
-            await self._create_lobby(app, meta, data)
+            await self._create_lobby(app, meta, data, _vk_interface_id(input))
 
         @app.handler(background=False)
         async def ask_join_code(app: App, input: Input) -> None:
@@ -104,14 +109,14 @@ class TicTacToeBot:
             data = _typed_data(input, AskJoinCodeInput)
             if meta is None or data is None:
                 return
-            await self._ask_join_code(app, meta, data)
+            await self._ask_join_code(app, meta, data, _vk_interface_id(input))
 
         @app.handler
         async def join_code(app: App, input: Input) -> None:
             meta = _vk_metadata(input)
             if meta is None or input.text is None:
                 return
-            await self._join_code(app, meta, input.text)
+            await self._join_code(app, meta, input.text, _vk_interface_id(input))
 
         @app.handler(background=False)
         async def cancel_join(app: App, input: Input) -> None:
@@ -119,9 +124,9 @@ class TicTacToeBot:
             data = _typed_data(input, CancelJoinInput)
             if meta is None or data is None:
                 return
-            if data.owner_id == meta.user_id and meta.interface_id is not None:
-                adapter = app.get_adapter(VKMessagesCallbackAdapter)
-                await adapter.delete(meta.interface_id)
+            interface_id = _vk_interface_id(input)
+            if data.owner_id == meta.user_id and interface_id is not None:
+                await app.get_adapter(VKMessagesCallbackAdapter).delete(interface_id)
 
         @app.handler(background=False)
         async def abandon_lobby(app: App, input: Input) -> None:
@@ -129,7 +134,7 @@ class TicTacToeBot:
             data = _typed_data(input, LobbyActionInput)
             if meta is None or data is None:
                 return
-            await self._abandon_lobby(app, meta, data)
+            await self._abandon_lobby(app, meta, data, _vk_interface_id(input))
 
         @app.handler(background=False)
         async def move(app: App, input: Input) -> None:
@@ -137,7 +142,7 @@ class TicTacToeBot:
             data = _typed_data(input, MoveInput)
             if meta is None or data is None:
                 return
-            await self._move(app, meta, data)
+            await self._move(app, meta, data, _vk_interface_id(input))
 
         @app.handler(background=False)
         async def surrender(app: App, input: Input) -> None:
@@ -145,7 +150,7 @@ class TicTacToeBot:
             data = _typed_data(input, SurrenderInput)
             if meta is None or data is None:
                 return
-            await self._surrender(app, meta, data)
+            await self._surrender(app, meta, data, _vk_interface_id(input))
 
         @app.handler(background=False)
         async def back_to_menu(app: App, input: Input) -> None:
@@ -153,7 +158,7 @@ class TicTacToeBot:
             data = _typed_data(input, BackToMenuInput)
             if meta is None or data is None:
                 return
-            await self._back_to_menu(app, meta, data)
+            await self._back_to_menu(app, meta, data, _vk_interface_id(input))
 
         @app.handler(background=False)
         async def close(app: App, input: Input) -> None:
@@ -161,9 +166,9 @@ class TicTacToeBot:
             data = _typed_data(input, CloseInput)
             if meta is None or data is None:
                 return
-            if data.owner_id == meta.user_id and meta.interface_id is not None:
-                adapter = app.get_adapter(VKMessagesCallbackAdapter)
-                await adapter.delete(meta.interface_id)
+            interface_id = _vk_interface_id(input)
+            if data.owner_id == meta.user_id and interface_id is not None:
+                await app.get_adapter(VKMessagesCallbackAdapter).delete(interface_id)
 
         @app.handler(background=False)
         async def noop(app: App, input: Input) -> None:
@@ -213,8 +218,8 @@ class TicTacToeBot:
         app: App,
         metadata: VKMessageMetadata,
         event: CreateLobbyInput,
+        interface_id: VKMessageInterfaceId | None,
     ) -> None:
-        interface_id = metadata.interface_id
         if event.owner_id != metadata.user_id or interface_id is None:
             return
         for _ in range(8):
@@ -262,9 +267,10 @@ class TicTacToeBot:
         app: App,
         metadata: VKMessageMetadata,
         event: AskJoinCodeInput,
+        interface_id: VKMessageInterfaceId | None,
     ) -> None:
-        if event.owner_id == metadata.user_id and metadata.interface_id is not None:
-            await self._render_join_prompt(app, metadata.interface_id, metadata.user_id)
+        if event.owner_id == metadata.user_id and interface_id is not None:
+            await self._render_join_prompt(app, interface_id, metadata.user_id)
 
     async def _render_join_prompt(
         self,
@@ -288,12 +294,12 @@ class TicTacToeBot:
         self,
         app: App,
         metadata: VKMessageMetadata,
-        input: str,
+        text: str,
+        interface_id: VKMessageInterfaceId | None,
     ) -> None:
-        interface_id = metadata.interface_id
         if interface_id is None:
             return
-        code = input.strip().upper()
+        code = text.strip().upper()
         if len(code) != 6 or any(character not in "0123456789ABCDEF" for character in code):
             return
         lobby_key = {
@@ -337,6 +343,7 @@ class TicTacToeBot:
         app: App,
         metadata: VKMessageMetadata,
         event: LobbyActionInput,
+        interface_id: VKMessageInterfaceId | None,
     ) -> None:
         key = {
             "app": "ttt",
@@ -349,13 +356,19 @@ class TicTacToeBot:
             if lobby is None or lobby.get("status") != "waiting":
                 return
             owner = lobby["owner"]
-            if not _is_owner(owner, metadata):
+            if not _is_owner(owner, metadata, interface_id):
                 return
             await app.delete_state(key)
-            if metadata.interface_id is not None:
-                await app.get_adapter(VKMessagesCallbackAdapter).delete(metadata.interface_id)
+            if interface_id is not None:
+                await app.get_adapter(VKMessagesCallbackAdapter).delete(interface_id)
 
-    async def _move(self, app: App, metadata: VKMessageMetadata, event: MoveInput) -> None:
+    async def _move(
+        self,
+        app: App,
+        metadata: VKMessageMetadata,
+        event: MoveInput,
+        interface_id: VKMessageInterfaceId | None,
+    ) -> None:
         key = {
             "app": "ttt",
             "kind": "game",
@@ -364,7 +377,7 @@ class TicTacToeBot:
         }
         async with app.lock(key):
             game = await app.get_state(key)
-            if game is None or not self._authorized_turn(game, metadata, event):
+            if game is None or not self._authorized_turn(game, metadata, event, interface_id):
                 return
             if not 0 <= event.cell < 9 or game["board"][event.cell] is not None:
                 return
@@ -388,6 +401,7 @@ class TicTacToeBot:
         app: App,
         metadata: VKMessageMetadata,
         event: SurrenderInput,
+        interface_id: VKMessageInterfaceId | None,
     ) -> None:
         key = {
             "app": "ttt",
@@ -399,7 +413,7 @@ class TicTacToeBot:
             game = await app.get_state(key)
             if (
                 game is None
-                or not self._authorized_player(game, metadata, event)
+                or not self._authorized_player(game, metadata, event, interface_id)
                 or game["status"] != "active"
             ):
                 return
@@ -414,6 +428,7 @@ class TicTacToeBot:
         app: App,
         metadata: VKMessageMetadata,
         event: BackToMenuInput,
+        interface_id: VKMessageInterfaceId | None,
     ) -> None:
         key = {
             "app": "ttt",
@@ -425,23 +440,24 @@ class TicTacToeBot:
         if (
             game is None
             or game["status"] != "finished"
-            or not self._participant_seat(game, metadata, event)
-            or metadata.interface_id is None
+            or not self._participant_seat(game, metadata, event, interface_id)
+            or interface_id is None
         ):
             return
-        await self._show_menu(app, metadata.peer_id, metadata.user_id, metadata.interface_id)
+        await self._show_menu(app, metadata.peer_id, metadata.user_id, interface_id)
 
     def _authorized_turn(
         self,
         game: dict[str, Any] | None,
         metadata: VKMessageMetadata,
         event: MoveInput,
+        interface_id: VKMessageInterfaceId | None,
     ) -> bool:
         return (
             game is not None
             and game["status"] == "active"
             and game["turn"] == event.seat
-            and self._participant_seat(game, metadata, event)
+            and self._participant_seat(game, metadata, event, interface_id)
         )
 
     def _authorized_player(
@@ -449,11 +465,12 @@ class TicTacToeBot:
         game: dict[str, Any] | None,
         metadata: VKMessageMetadata,
         event: GameActionInput,
+        interface_id: VKMessageInterfaceId | None,
     ) -> bool:
         return (
             game is not None
             and 0 <= event.seat < 2
-            and self._participant_seat(game, metadata, event)
+            and self._participant_seat(game, metadata, event, interface_id)
         )
 
     @staticmethod
@@ -461,16 +478,17 @@ class TicTacToeBot:
         game: dict[str, Any],
         metadata: VKMessageMetadata,
         event: GameActionInput | MoveInput,
+        interface_id: VKMessageInterfaceId | None,
     ) -> bool:
         seat = getattr(event, "seat", None)
         if not isinstance(seat, int) or not 0 <= seat < 2:
             return False
         player = game["players"][seat]
         return (
-            metadata.interface_id is not None
+            interface_id is not None
             and player["user_id"] == metadata.user_id
             and player["peer_id"] == metadata.peer_id
-            and _stored_interface_id(player) == metadata.interface_id.model_dump(mode="json")
+            and _stored_interface_id(player) == interface_id.model_dump(mode="json")
         )
 
     async def _render_game(self, app: App, group_id: int, game: dict[str, Any]) -> None:
@@ -588,13 +606,21 @@ def attach_fastapi(app: App):
     @web.post("/vk/callback")
     async def callback(request: Request) -> PlainTextResponse:
         response = await app.handle_input(await request.body())
-        return PlainTextResponse(response if isinstance(response, str) else "ok")
+        return PlainTextResponse("ok" if response is None else str(response))
 
     return web
 
 
 def _vk_metadata(event: Input) -> VKMessageMetadata | None:
     return event.metadata if isinstance(event.metadata, VKMessageMetadata) else None
+
+
+def _vk_interface_id(event: Input) -> VKMessageInterfaceId | None:
+    return (
+        event.interface_id
+        if isinstance(event.interface_id, VKMessageInterfaceId)
+        else None
+    )
 
 
 def _typed_data[TicTacToeInputT: InputData](
@@ -609,12 +635,16 @@ def _typed_data[TicTacToeInputT: InputData](
         return None
 
 
-def _is_owner(owner: dict[str, Any], metadata: VKMessageMetadata) -> bool:
+def _is_owner(
+    owner: dict[str, Any],
+    metadata: VKMessageMetadata,
+    interface_id: VKMessageInterfaceId | None,
+) -> bool:
     return (
         owner["user_id"] == metadata.user_id
         and owner["peer_id"] == metadata.peer_id
-        and metadata.interface_id is not None
-        and _stored_interface_id(owner) == metadata.interface_id.model_dump(mode="json")
+        and interface_id is not None
+        and _stored_interface_id(owner) == interface_id.model_dump(mode="json")
     )
 
 

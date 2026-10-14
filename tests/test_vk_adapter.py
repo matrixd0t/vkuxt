@@ -103,7 +103,9 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
         app = App(MemoryStorage())
         vk = FakeVK()
         app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
-        received: list[tuple[VKMessageMetadata, str | None, StartInput | None]] = []
+        received: list[
+            tuple[VKMessageMetadata, str | None, StartInput | None, VKMessageInterfaceId | None]
+        ] = []
         logged: list[tuple[str | None, InputData | None]] = []
         other_calls: list[OtherStartInput] = []
 
@@ -120,7 +122,7 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
                     data = StartInput.model_validate(input.data.model_dump())
                 except ValueError:
                     return
-            received.append((input.metadata, input.text, data))
+            received.append((input.metadata, input.text, data, input.interface_id))
 
         @app.handler(background=False)
         async def log_input(app: App, input: Input) -> None:
@@ -154,6 +156,8 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
         assert received[-1][0].peer_id == 2000000001
         assert received[-1][0].group_id == 71
         assert received[-1][0].user_id == 5
+        assert received[-1][0].event_type == "message_event"
+        assert received[-1][3] is None
         assert isinstance(logged[-1][1], InputData)
         assert logged[-1][1].model_dump()["source"] == "button"
         assert other_calls == []
@@ -179,6 +183,8 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
         assert received[-1][1] == "начать"
         assert received[-1][2] is None
         assert received[-1][0].peer_id == 5
+        assert received[-1][0].event_type == "message_new"
+        assert received[-1][3] is None
         assert logged[-1] == ("начать", None)
         await app.close()
 
@@ -190,14 +196,16 @@ def test_only_oversized_button_payloads_are_tokenized() -> None:
         app = App(MemoryStorage())
         vk = FakeVK()
         adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
-        received: list[StartInput] = []
+        received: list[tuple[StartInput, VKMessageInterfaceId | None]] = []
 
         @app.handler(background=False)
         async def start(app: App, input: Input) -> None:
             if input.data is None:
                 return
             try:
-                received.append(StartInput.model_validate(input.data.model_dump()))
+                received.append(
+                    (StartInput.model_validate(input.data.model_dump()), input.interface_id)
+                )
             except ValueError:
                 return
 
@@ -222,7 +230,8 @@ def test_only_oversized_button_payloads_are_tokenized() -> None:
             },
         }
         await app.handle_input(callback)
-        assert received[-1].source == "x" * 300
+        assert received[-1][0].source == "x" * 300
+        assert received[-1][1] == interface_id
 
         disabled = App(tokenize_long_input=False)
         assert isinstance(
@@ -243,20 +252,25 @@ def test_callback_ack_is_skipped_when_pressed_interface_is_edited() -> None:
 
         @app.handler(background=False)
         async def edit(app: App, input: Input) -> None:
-            if not isinstance(input.metadata, VKMessageMetadata) or input.data is None:
+            if (
+                not isinstance(input.metadata, VKMessageMetadata)
+                or not isinstance(input.interface_id, VKMessageInterfaceId)
+                or input.data is None
+            ):
                 return
             try:
                 EditInput.model_validate(input.data.model_dump())
             except ValueError:
                 return
             await adapter.edit(
-                input.metadata.interface_id,
+                input.interface_id,
                 "updated",
                 app.new_interface(),
                 keyboard='{"buttons":[]}',
             )
 
         message_id = VKMessageInterfaceId(cmid=10, peer_id=2000000001, group_id=71)
+        await app.register_interface(message_id, app.new_interface())
         payload = {
             "type": "message_event",
             "group_id": 71,

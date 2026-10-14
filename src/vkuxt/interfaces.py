@@ -22,10 +22,7 @@ class Interface:
     tokenize_long_input: bool = True
     actions: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    def bind(
-        self,
-        data: BaseModel | dict[str, Any],
-    ) -> str | dict[str, Any]:
+    def bind(self, data: BaseModel | dict[str, Any]) -> str | dict[str, Any]:
         from .app import InputData
 
         if isinstance(data, InputData):
