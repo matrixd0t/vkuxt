@@ -1,5 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "vkuxt"
 version = "0.1.0"
+description = "Асинхронный каркас для приложений и ботов VK"
+readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["vk", "vk-api", "asyncio", "bot", "callback-api"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Typing :: Typed",
+]
+dependencies = [
+    "matrix-planner>=0.2.1",
+    "pydantic>=2.13.5",
+    "vkx[http]>=0.1.10"
+]
+
+[project.optional-dependencies]
+redis = ["redis>=5"]
+dev = ["fastapi>=0.110", "pytest>=8", "ruff>=0.6", "pyright>=1.1", "vkx>=0.1.10"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vkuxt"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/vkuxt", "examples", "pyproject.toml", "README.md", "LICENSE"]
+
+[tool.ruff]
+src = ["src"]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "BLE", "RUF"]
+
+
+[tool.pyright]
+include = ["src/vkuxt"]
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"
