@@ -67,7 +67,7 @@ class MemoryStorage:
 
 
 class JSONFileStorage:
-    """Однопроцессное JSON-хранилище с атомарной заменой файла."""
+    """Однопроцессное JSON-хранилище с атомарной заменой файла."""  # noqa: RUF002
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)

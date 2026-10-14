@@ -9,9 +9,9 @@ from starlette.applications import Starlette
 
 from vkuxt import (
     Adapter,
-    AdapterInput,
     App,
     EventMetadata,
+    Input,
     InputData,
     JSONFileStorage,
     MemoryStorage,
@@ -77,31 +77,31 @@ def test_input_data_rejects_non_json_values() -> None:
         value.value = object()
 
 
-def test_handler_types_are_inferred_and_long_payload_tokens_persist(tmp_path) -> None:
+def test_handlers_receive_input_data_and_long_payload_tokens_persist(tmp_path) -> None:
     async def scenario() -> None:
         path = tmp_path / "state.json"
         calls: list[EchoInput] = []
         app = App(JSONFileStorage(path))
 
         @app.handler
-        async def echo(app: App, meta: EchoMetadata, data: EchoInput) -> None:
+        async def echo(app: App, input: Input) -> None:
             assert isinstance(app, App)
-            assert meta.user_id == 4
-            calls.append(data)
+            assert isinstance(input.metadata, EchoMetadata)
+            assert input.metadata.user_id == 4
+            assert input.data is not None
+            calls.append(EchoInput.model_validate(input.data.model_dump()))
 
         interface_id = {"cmid": 80, "peer_id": 2000000001, "group_id": 71}
         first = app.new_interface()
         direct_payload = first.bind(EchoInput(handler_name="echo-data", text="bound"))
         assert direct_payload == {"handler_name": "echo-data", "text": "bound"}
-        old_token = first.bind(
-            EchoInput(handler_name="echo-data", text="old", extra="x" * 300)
-        )
+        old_token = first.bind(EchoInput(handler_name="echo-data", text="old", extra="x" * 300))
         assert isinstance(old_token, str)
         await app.register_interface(interface_id, first)
         await app.close()
 
         restored = App(JSONFileStorage(path))
-        restored.add_handler(echo)
+        restored.add_handler(echo, background=False)
         current = restored.new_interface()
         new_token = current.bind(
             EchoInput(handler_name="echo-data", text="current", extra="y" * 300)
@@ -113,8 +113,10 @@ def test_handler_types_are_inferred_and_long_payload_tokens_persist(tmp_path) ->
         assert record is not None
         assert old_token not in record.actions
         await restored.dispatch_event(
-            EchoMetadata(user_id=4),
-            data=record.actions[new_token]["data"],
+            Input(
+                EchoMetadata(user_id=4),
+                data=record.actions[new_token]["data"],
+            )
         )
         assert calls[-1].text == "current"
         await restored.close()
@@ -131,7 +133,7 @@ def test_state_storage_models_and_ttl() -> None:
         await asyncio.sleep(0.03)
         assert await app.get_state(key) is None
 
-        def unused(app: App, meta: EchoMetadata, data: EchoInput) -> None:
+        def unused(app: App, input: Input) -> None:
             return None
 
         app.add_handler(unused)
@@ -223,7 +225,7 @@ def test_app_owns_adapter_lifecycle_through_starlette_lifespan() -> None:
     asyncio.run(scenario())
 
 
-def test_raw_input_tries_adapters_in_order_and_dispatches_by_annotations() -> None:
+def test_raw_input_tries_adapters_in_order_and_passes_input_to_handlers() -> None:
     class OtherMetadata(EventMetadata):
         pass
 
@@ -234,31 +236,59 @@ def test_raw_input_tries_adapters_in_order_and_dispatches_by_annotations() -> No
             self.calls = calls
             self.handled = handled
 
-        async def parse_input(self, raw: dict) -> AdapterInput | None:
+        async def parse_input(self, raw: dict) -> Input | None:
             self.calls.append(self.name)
             if not self.handled:
                 return None
-            return AdapterInput(EchoMetadata(user_id=9), input=raw["text"])
+            return Input(
+                EchoMetadata(user_id=9),
+                data={"source": "payload"},
+                text=raw["text"],
+            )
 
     async def scenario() -> None:
         app = App()
         parser_calls: list[str] = []
-        received: list[tuple[int, str]] = []
+        received: list[tuple[int, str, str]] = []
+        seen_by_echo: list[Input] = []
+        seen_by_other: list[Input] = []
+        other_metadata: list[OtherMetadata] = []
         app.add_adapter(ParserAdapter, "first", parser_calls, False)
         app.add_adapter(ParserAdapter, "second", parser_calls, True)
         app.add_adapter(ParserAdapter, "third", parser_calls, True)
 
-        @app.handler
-        async def echo(app: App, meta: EchoMetadata, input: str) -> None:
-            received.append((meta.user_id, input))
+        @app.handler(background=False)
+        async def echo(app: App, input: Input) -> str:
+            if (
+                isinstance(input.metadata, EchoMetadata)
+                and input.data is not None
+                and input.text is not None
+            ):
+                received.append(
+                    (
+                        input.metadata.user_id,
+                        input.text,
+                        input.data.model_dump()["source"],
+                    )
+                )
+                seen_by_echo.append(input)
+                return "ok"
+            return "ignored"
 
-        @app.handler
-        async def other(app: App, meta: OtherMetadata, input: str) -> None:
-            raise AssertionError("несовместимая модель метаданных не должна вызываться")
+        @app.handler(background=False)
+        async def other(app: App, input: object) -> None:
+            assert isinstance(input, Input)
+            seen_by_other.append(input)
+            if isinstance(input.metadata, OtherMetadata):
+                other_metadata.append(input.metadata)
 
         assert await app.handle_input({"text": "hello"}) == "ok"
         assert parser_calls == ["first", "second"]
-        assert received == [(9, "hello")]
+        assert received == [(9, "hello", "payload")]
+        assert seen_by_echo[0] is seen_by_other[0]
+        assert await app.dispatch_event(Input(OtherMetadata())) == "ignored"
+        assert len(other_metadata) == 1
+        assert seen_by_other[1].metadata is other_metadata[0]
         await app.close()
 
     asyncio.run(scenario())

@@ -9,11 +9,12 @@ from vkx.server import CallbackServer
 
 from vkuxt import (
     App,
+    Input,
     InputData,
     MemoryStorage,
     VKCallbackAdapter,
-    VKMessageMetadata,
     VKMessageInterfaceId,
+    VKMessageMetadata,
     VKMessagesAdapter,
     VKMessagesCallbackAdapter,
 )
@@ -84,14 +85,14 @@ def test_send_registers_the_vk_external_mount_id() -> None:
 def test_manual_confirmation_is_not_rejected_for_missing_secret() -> None:
     async def scenario() -> None:
         app = App(MemoryStorage())
-        adapter = app.add_adapter(
+        app.add_adapter(
             VKMessagesCallbackAdapter,
             FakeVK(),
             group_id=71,
             confirmation_code="confirm-me",
             secret="callback-secret",
         )
-        assert await adapter.handle({"type": "confirmation", "group_id": 71}) == "confirm-me"
+        assert await app.handle_input({"type": "confirmation", "group_id": 71}) == "confirm-me"
         await app.close()
 
     asyncio.run(scenario())
@@ -106,27 +107,34 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
         logged: list[tuple[str | None, InputData | None]] = []
         other_calls: list[OtherStartInput] = []
 
-        @app.handler
+        @app.handler(background=False)
         async def start(
             app: App,
-            meta: VKMessageMetadata,
-            input: str | None = None,
-            data: StartInput | None = None,
+            input: Input,
         ) -> None:
-            received.append((meta, input, data))
+            if not isinstance(input.metadata, VKMessageMetadata):
+                return
+            data = None
+            if input.data is not None:
+                try:
+                    data = StartInput.model_validate(input.data.model_dump())
+                except ValueError:
+                    return
+            received.append((input.metadata, input.text, data))
 
-        @app.handler
-        async def log_input(
-            app: App,
-            meta: VKMessageMetadata,
-            input: str | None = None,
-            data: InputData | None = None,
-        ) -> None:
-            logged.append((input, data))
+        @app.handler(background=False)
+        async def log_input(app: App, input: Input) -> None:
+            if isinstance(input.metadata, VKMessageMetadata):
+                logged.append((input.text, input.data))
 
-        @app.handler
-        async def other(app: App, meta: VKMessageMetadata, data: OtherStartInput) -> None:
-            other_calls.append(data)
+        @app.handler(background=False)
+        async def other(app: App, input: Input) -> None:
+            if not isinstance(input.metadata, VKMessageMetadata) or input.data is None:
+                return
+            try:
+                other_calls.append(OtherStartInput.model_validate(input.data.model_dump()))
+            except ValueError:
+                return
 
         click = {
             "type": "message_event",
@@ -139,7 +147,7 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
                 "payload": json.dumps({"handler_name": "begin-action", "source": "button"}),
             },
         }
-        assert await app.handle_input(click) == "ok"
+        assert await app.handle_input(click) is None
         assert received[-1][1] is None
         assert isinstance(received[-1][2], StartInput)
         assert received[-1][2].source == "button"
@@ -167,7 +175,7 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
                 }
             },
         }
-        assert await app.handle_input(message) == "ok"
+        assert await app.handle_input(message) is None
         assert received[-1][1] == "начать"
         assert received[-1][2] is None
         assert received[-1][0].peer_id == 5
@@ -184,9 +192,14 @@ def test_only_oversized_button_payloads_are_tokenized() -> None:
         adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
         received: list[StartInput] = []
 
-        @app.handler
-        async def start(app: App, meta: VKMessageMetadata, data: StartInput) -> None:
-            received.append(data)
+        @app.handler(background=False)
+        async def start(app: App, input: Input) -> None:
+            if input.data is None:
+                return
+            try:
+                received.append(StartInput.model_validate(input.data.model_dump()))
+            except ValueError:
+                return
 
         draft = app.new_interface()
         compact = draft.bind(StartInput(handler_name="begin-action", source="button"))
@@ -213,9 +226,7 @@ def test_only_oversized_button_payloads_are_tokenized() -> None:
 
         disabled = App(tokenize_long_input=False)
         assert isinstance(
-            disabled.new_interface().bind(
-                {"handler_name": "begin-action", "source": "x" * 300}
-            ),
+            disabled.new_interface().bind({"handler_name": "begin-action", "source": "x" * 300}),
             dict,
         )
         await disabled.close()
@@ -230,14 +241,16 @@ def test_callback_ack_is_skipped_when_pressed_interface_is_edited() -> None:
         vk = FakeVK()
         adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
 
-        @app.handler
-        async def edit(
-            app: App,
-            meta: VKMessageMetadata,
-            data: EditInput,
-        ) -> None:
+        @app.handler(background=False)
+        async def edit(app: App, input: Input) -> None:
+            if not isinstance(input.metadata, VKMessageMetadata) or input.data is None:
+                return
+            try:
+                EditInput.model_validate(input.data.model_dump())
+            except ValueError:
+                return
             await adapter.edit(
-                meta.interface_id,
+                input.metadata.interface_id,
                 "updated",
                 app.new_interface(),
                 keyboard='{"buttons":[]}',

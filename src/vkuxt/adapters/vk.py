@@ -10,9 +10,9 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from ..app import Adapter, AdapterInput, App, EventMetadata
+from ..app import Adapter, App, EventMetadata, Input
 from ..codec import decode_key, encode_key
-from ..interfaces import InterfaceDraft
+from ..interfaces import Interface
 
 
 class VKMessageInterfaceId(BaseModel):
@@ -30,6 +30,10 @@ class VKMessageMetadata(EventMetadata):
     cmid: int | None = None
     event_id: str | None = None
     interface_id: VKMessageInterfaceId | None = None
+
+
+class _VKConfirmationMetadata(EventMetadata):
+    group_id: int
 
 
 class VKMessagesAdapter(Adapter, ABC):
@@ -50,7 +54,7 @@ class VKMessagesAdapter(Adapter, ABC):
         self,
         peer_id: int,
         text: str,
-        interface: InterfaceDraft,
+        interface: Interface,
         *,
         keyboard: Any = None,
     ) -> VKMessageInterfaceId:
@@ -79,7 +83,7 @@ class VKMessagesAdapter(Adapter, ABC):
         self,
         interface_id: VKMessageInterfaceId,
         text: str,
-        interface: InterfaceDraft,
+        interface: Interface,
         *,
         keyboard: Any = None,
     ) -> bool:
@@ -197,14 +201,23 @@ class VKCallbackAdapter(Adapter, ABC):
             f"vkuxt_vk_changed_{id(self)}", default=False
         )
 
-    async def handle(self, raw: bytes | bytearray | str | dict[str, Any]) -> str:
-        response = await self.app.handle_input(bytes(raw) if isinstance(raw, bytearray) else raw)
-        return response if isinstance(response, str) else "ok"
+        async def confirmation(app: App, input: Input) -> str | None:
+            if not isinstance(input.metadata, _VKConfirmationMetadata):
+                return None
+            if input.metadata.group_id != self.group_id:
+                return None
+            return self.confirmation_code or getattr(
+                self.callback_server,
+                "confirmation_code",
+                "",
+            )
+
+        self.app.add_handler(confirmation, background=False)
 
     async def parse_input(
         self,
         raw: str | bytes | bytearray | Mapping[str, Any],
-    ) -> AdapterInput | None:
+    ) -> Input | None:
         if _raw_event_type(raw) not in {"confirmation", "message_event", "message_new"}:
             return None
         callback_raw = dict(raw) if isinstance(raw, Mapping) else raw
@@ -222,23 +235,22 @@ class VKCallbackAdapter(Adapter, ABC):
 
                 candidate = parse_callback(callback_raw)
                 if _event_type(candidate) == "confirmation" and candidate.group_id == self.group_id:
-                    return AdapterInput(None, None, response=confirmation_code)
+                    return Input(_VKConfirmationMetadata(group_id=self.group_id))
             return None
         event_type = _event_type(event)
         if event_type == "confirmation":
-            confirmation_code = (
-                self.confirmation_code or getattr(self.callback_server, "confirmation_code", "")
-            )
-            return AdapterInput(None, None, response=confirmation_code or "")
+            if event.group_id != self.group_id:
+                return None
+            return Input(_VKConfirmationMetadata(group_id=self.group_id))
         if event.group_id != self.group_id:
             return None
         if event_type == "message_event":
             return await self._parse_message_event(event)
         if event_type == "message_new":
             return await self._parse_message_new(event)
-        return AdapterInput(None, None)
+        return None
 
-    async def _parse_message_event(self, event: Any) -> AdapterInput:
+    async def _parse_message_event(self, event: Any) -> Input | None:
         obj = event.object
         payload = obj.payload
         cmid = obj.conversation_message_id
@@ -246,7 +258,7 @@ class VKCallbackAdapter(Adapter, ABC):
         user_id = obj.user_id
         event_id = obj.event_id
         if peer_id is None or user_id is None or event_id is None:
-            return AdapterInput(None, None)
+            return None
 
         interface_id = (
             VKMessageInterfaceId(cmid=int(cmid), peer_id=int(peer_id), group_id=self.group_id)
@@ -277,16 +289,16 @@ class VKCallbackAdapter(Adapter, ABC):
             action = record.actions.get(payload) if record is not None else None
             if action is not None:
                 action_data = action.get("data")
-        return AdapterInput(
+        return Input(
             metadata,
             data=action_data,
             acknowledge=True,
         )
 
-    async def _parse_message_new(self, event: Any) -> AdapterInput:
+    async def _parse_message_new(self, event: Any) -> Input | None:
         message = event.object.message
         if message is None or message.from_id is None or message.peer_id is None:
-            return AdapterInput(None, None)
+            return None
         user_id = int(message.from_id)
         peer_id = int(message.peer_id)
         cmid = message.conversation_message_id
@@ -306,9 +318,9 @@ class VKCallbackAdapter(Adapter, ABC):
             cmid=int(cmid) if cmid is not None else None,
             interface_id=interface_id,
         )
-        return AdapterInput(metadata, input=message.text or "")
+        return Input(metadata, text=message.text or "")
 
-    async def dispatch_input(self, event: AdapterInput) -> Any:
+    async def dispatch_input(self, event: Input) -> Any:
         if not event.acknowledge or not isinstance(event.metadata, VKMessageMetadata):
             return await super().dispatch_input(event)
         metadata = event.metadata
@@ -360,8 +372,13 @@ class VKMessagesCallbackAdapter(VKCallbackAdapter, VKMessagesAdapter):
     ) -> None:
         VKMessagesAdapter.__init__(self, app, vk, group_id)
         VKCallbackAdapter.__init__(
-            self, app, group_id, callback_server=callback_server, confirmation_code=confirmation_code,
-            secret=secret,dm_latest_interface=dm_latest_interface
+            self,
+            app,
+            group_id,
+            callback_server=callback_server,
+            confirmation_code=confirmation_code,
+            secret=secret,
+            dm_latest_interface=dm_latest_interface,
         )
 
     @property

@@ -17,7 +17,7 @@ TTLValue = float | None | _DefaultTTL
 
 
 @dataclass(slots=True)
-class InterfaceDraft:
+class Interface:
     ttl: TTLValue = DEFAULT_TTL
     tokenize_long_input: bool = True
     actions: dict[str, dict[str, Any]] = field(default_factory=dict)

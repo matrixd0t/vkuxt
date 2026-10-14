@@ -4,13 +4,13 @@
 
 ## Модель
 
-- `App` передаёт сырой ввод адаптерам по очереди. Первый распознавший формат адаптер возвращает метаданные и смысловую часть события.
-- `EventMetadata` описывает данные отправителя и транспорта. Типизированные данные наследуются от `InputData`; произвольный ввод передаётся обработчику обычной строкой.
-- `@app.handler` выводит допустимые модели метаданных и ввода из строгой сигнатуры `(app: App, meta: EventMetadata, input?, data?)`. Подходящие хендлеры получают событие по совместимости типов; имена функций на маршрутизацию не влияют.
-- `InputData` проверяет строгую JSON-сериализуемость при Pydantic-валидации и присваивании. `handler_name` — обычное поле модели; если нужно сузить совпадение по данным, объявите его как `Literal[...]` в конкретной модели.
+- `App` передаёт сырой ввод адаптерам по очереди. Первый распознавший формат адаптер возвращает `Input` с полями `metadata`, `data` и `text`; текст и typed payload могут присутствовать одновременно.
+- `metadata` содержит адаптер-специфичный экземпляр `EventMetadata`, `data` — базовый `InputData` или `None`, а `text` — строку или `None`.
+- `@app.handler` принимает хендлеры с сигнатурой `(app: App, input: Input)`. Каждому хендлеру передаётся всё событие без фильтрации по аннотациям; он сам проверяет метаданные и решает, преобразовывать ли `data` в свою модель. По умолчанию хендлер запускается в `asyncio.Task`, а `@app.handler(background=False)` ожидает его завершения и возвращает непустой результат адаптеру.
+- `InputData` проверяет строгую JSON-сериализуемость при Pydantic-валидации и присваивании. `handler_name` — обычное поле модели; хендлер может использовать его или валидировать данные в конкретную модель с полем `Literal[...]`.
 - Ключи приложения — обычные словари или модели. `encode_key` канонически сериализует их; модели сохраняют в сериализации полное имя типа, данные сортируются по ключам. Такой же codec используется всеми storage-бэкендами и адаптерами.
-- Интерфейс адресуется внешним идентификатором. Для сообщения VK это `VKMessageMountId(cmid, peer_id, group_id)`; отдельного внутреннего ID нет.
-- `InterfaceDraft.bind()` обычно возвращает словарь typed input напрямую. Только payload длиннее лимита VK заменяется коротким token, данные которого хранятся в записи интерфейса; опция отключается через `App(tokenize_long_input=False)`.
+- Интерфейс адресуется внешним идентификатором. Для сообщения VK это `VKMessageInterfaceId(cmid, peer_id, group_id)`; отдельного внутреннего ID нет.
+- `Interface.bind()` обычно возвращает словарь typed input напрямую. Только payload длиннее лимита VK заменяется коротким token, данные которого хранятся в записи интерфейса; опция отключается через `App(tokenize_long_input=False)`.
 - Повторный `register_interface()` заменяет таблицу больших token-payload. Рендеринг остаётся ответственностью приложения или адаптера.
 - Handler может явно блокировать одно или несколько состояний через `async with app.lock(key, ...)`. Lock удерживается во время тела блока; читайте состояние после получения lock. Ключи блокируются в каноническом порядке, вложенное получение того же lock допустимо. Блокировки процессные и рассчитаны на один event loop/процесс.
 - Изменение состояния само по себе не инициирует перерисовку. Handler решает, какие интерфейсы менять, удалять или оставлять без изменений.
@@ -20,30 +20,39 @@
 ```python
 from typing import Literal
 
-from vkuxt import App, EventMetadata, InputData, MemoryStorage
+from vkuxt import App, EventMetadata, Input, InputData, MemoryStorage
 
 app = App(storage=MemoryStorage())
 
+
 class GreetingMetadata(EventMetadata):
     user_id: int
+
 
 class Greeting(InputData):
     handler_name: Literal["greeting-data"]
     text: str
 
-@app.handler
+
+@app.handler(background=False)
 async def greeting(
     app: App,
-    meta: GreetingMetadata,
-    input: str | None = None,
-    data: Greeting | None = None,
+    input: Input,
 ) -> None:
+    if not isinstance(input.metadata, GreetingMetadata):
+        return
+    data = None
+    if input.data is not None:
+        try:
+            data = Greeting.model_validate(input.data.model_dump())
+        except ValueError:
+            pass
     if data is not None:
         text = data.text
-    elif input is not None:
-        if input.casefold() != "привет":
+    elif input.text is not None:
+        if input.text.casefold() != "привет":
             return
-        text = input
+        text = input.text
     else:
         return
     key = {"kind": "greeting-count", "user_id": meta.user_id}
@@ -52,9 +61,9 @@ async def greeting(
         await app.set_state(key, count + 1)
 ```
 
-Адаптер строит `GreetingMetadata` из транспортных полей. Для произвольного текста обработчик получает `input: str`, а для typed payload — экземпляр модели `Greeting`. `handler_name` здесь — обычное поле модели: `Literal` ограничивает, какие данные принимает эта аннотация; диспетчер не интерпретирует это поле. `model_construct()` намеренно обходит обычную валидацию Pydantic.
+Адаптер строит `GreetingMetadata` из транспортных полей. Хендлер получает объект `Input`, а при необходимости сам валидирует его базовый `InputData` в модель `Greeting`. `handler_name` — обычное поле модели: `Literal` ограничивает результат такой валидации, диспетчер это поле не интерпретирует. `background=False` ожидает выполнения и передаёт результат обратно адаптеру; для HTTP-ответа приложение само решает, как его использовать. `model_construct()` намеренно обходит обычную валидацию Pydantic.
 
-Для кнопки приложение создаёт draft интерфейса и кладёт payload в кнопку. Когда площадка отправила/обновила сообщение и получила внешний ID, draft сохраняется под этим ID:
+Для кнопки приложение создаёт `Interface` и кладёт payload в кнопку. Когда площадка отправила/обновила сообщение и получила внешний ID, `Interface` сохраняется под этим ID:
 
 ```python
 draft = app.new_interface()
@@ -63,7 +72,7 @@ payload = draft.bind(Greeting(handler_name="greeting-data", text="кнопка")
 await app.register_interface(vk_message_mount_id, draft)
 ```
 
-`App.handle_input(raw)` передаёт запрос адаптерам по очереди. VK-адаптер возвращает `VKMessageMetadata` отдельно от строки либо словаря payload-кнопки; приложение валидирует словарь во все подходящие `data`-модели по сигнатурам хендлеров. `VKMessageMetadata` включает `group_id`, `chat_id`, `user_id` и, если известно, `interface_id`.
+`App.handle_input(raw)` передаёт запрос адаптерам по очереди и возвращает результат синхронного (`background=False`) хендлера. VK-адаптер строит `Input` с `VKMessageMetadata`, `InputData` и текстом; одно событие может содержать текст и payload одновременно. `VKMessageMetadata` включает `group_id`, `peer_id`, `user_id` и, если известно, `interface_id`.
 
 ## Хранилища и TTL
 
