@@ -24,7 +24,7 @@ classifiers = [
 dependencies = [
     "matrix-planner>=0.2.1",
     "pydantic>=2.13.5",
-    "vkx[http]>=0.1.10"
+    "vkx[http]>=0.1.11"
 ]
 
 [project.optional-dependencies]
@@ -52,3 +52,8 @@ pythonVersion = "3.13"
 venvPath = "."
 venv = ".venv"
 typeCheckingMode = "basic"
+
+[dependency-groups]
+dev = [
+    "vkx==0.1.11",
+]

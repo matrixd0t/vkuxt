@@ -6,13 +6,15 @@ import json
 import secrets
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
+from vkx.models import AttachmentsInput, Keyboard, Message
 
-from ..app import Adapter, App, Input, InputMetadata
+from ..app import Adapter, App, BaseMetadata, Input
 from ..codec import decode_key, encode_key
-from ..interfaces import Interface
+from ..interfaces import DEFAULT_TTL, Interface, TTLValue
 
 
 class VKMessageInterfaceId(BaseModel):
@@ -21,18 +23,48 @@ class VKMessageInterfaceId(BaseModel):
     group_id: int
 
 
-class VKMessageMetadata(InputMetadata):
+class VKMessageMetadata(BaseMetadata):
     """Метаданные входящего сообщения VK."""
 
     event_type: Literal["message_event", "message_new"]
     group_id: int
     peer_id: int
     user_id: int
-    cmid: int | None = None
+    msg: Message | None = None
     event_id: str | None = None
+    _interface_cmid: int | None = PrivateAttr(default=None)
+    _message_cmid: int | None = PrivateAttr(default=None)
+    _reply_cmid: int | None = PrivateAttr(default=None)
 
 
-class _VKConfirmationMetadata(InputMetadata):
+type VKMessageInput = Input[Any, VKMessageMetadata]
+
+
+@dataclass(slots=True)
+class VKMessageTemplate(Interface):
+    """Готовое состояние сообщения VK вместе с данными callback-кнопок."""  # noqa: RUF002
+
+    attachments: AttachmentsInput | None = None
+    text: str = ""
+    kb: Keyboard | str | None = None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "text":
+            if not isinstance(value, str):
+                raise TypeError("text шаблона VK должен быть строкой")
+            value = value[:4096]
+        object.__setattr__(self, name, value)
+
+
+@dataclass(slots=True)
+class _VKDispatchContext:
+    metadata: VKMessageMetadata
+    interface_id: VKMessageInterfaceId | None
+    is_reply: bool
+    callback_changed: bool = False
+
+
+class _VKConfirmationMetadata(BaseMetadata):
     group_id: int
 
 
@@ -44,6 +76,9 @@ class VKMessagesAdapter(Adapter, ABC):
         self._vk = vk
         self.group_id = group_id
         self._peer_lock = asyncio.Lock()
+        self._vk_event_context: contextvars.ContextVar[_VKDispatchContext | None] = (
+            contextvars.ContextVar(f"vkuxt_vk_event_{id(self)}", default=None)
+        )
 
     @property
     @abstractmethod
@@ -57,6 +92,8 @@ class VKMessagesAdapter(Adapter, ABC):
         interface: Interface,
         *,
         keyboard: Any = None,
+        attachments: AttachmentsInput | None = None,
+        reply_to: int | None = None,
     ) -> VKMessageInterfaceId:
         response = await self.vk.messages.send(
             peer_ids=[peer_id],
@@ -64,6 +101,8 @@ class VKMessagesAdapter(Adapter, ABC):
             group_id=self.group_id,
             message=text,
             keyboard=_keyboard_json(keyboard),
+            attachment=attachments,
+            reply_to=reply_to,
         )
         try:
             item = response[0][0]
@@ -86,6 +125,7 @@ class VKMessagesAdapter(Adapter, ABC):
         interface: Interface,
         *,
         keyboard: Any = None,
+        attachments: AttachmentsInput | None = None,
     ) -> bool:
         changed = await self.vk.messages.edit(
             peer_id=interface_id.peer_id,
@@ -93,6 +133,7 @@ class VKMessagesAdapter(Adapter, ABC):
             group_id=interface_id.group_id,
             message=text,
             keyboard=_keyboard_json(keyboard, clear_none=True),
+            attachment=attachments if attachments is not None else "",
         )
         if changed:
             self._mark_current_interface(interface_id)
@@ -111,6 +152,98 @@ class VKMessagesAdapter(Adapter, ABC):
         await self._forget_interface(interface_id)
         self._mark_current_interface(interface_id)
         return bool(response)
+
+    def new_interface(
+        self,
+        *,
+        text: str = "",
+        attachments: AttachmentsInput | None = None,
+        kb: Keyboard | str | None = None,
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> VKMessageTemplate:
+        return VKMessageTemplate(
+            ttl=ttl,
+            tokenize_long_input=self.app.tokenize_long_input,
+            attachments=attachments,
+            text=text,
+            kb=kb,
+        )
+
+    def _mark_current_interface(self, interface_id: VKMessageInterfaceId) -> None:
+        return None
+
+    async def transition(
+        self,
+        interface: VKMessageTemplate | None,
+        *,
+        peer_id: int | None = None,
+    ) -> None:
+        """Перевести интерфейс пользователя в новое состояние."""
+        context = self._vk_event_context.get()
+        if context is None:
+            if peer_id is None:
+                raise RuntimeError("transition() требует VK-событие или peer_id")
+            recipient = peer_id
+            same_event = False
+            current = await self._latest_interface(recipient)
+        else:
+            recipient = context.metadata.peer_id if peer_id is None else peer_id
+            same_event = context.metadata.peer_id == recipient
+            current = (
+                context.interface_id if same_event else await self._latest_interface(recipient)
+            )
+
+        if interface is None:
+            if current is not None:
+                await self.delete(current)
+            return
+        if (
+            same_event
+            and context is not None
+            and context.metadata.event_type == "message_new"
+            and not context.is_reply
+        ):
+            current = None
+
+        if (
+            same_event
+            and context is not None
+            and context.metadata.event_type == "message_new"
+            and context.is_reply
+            and context.metadata._message_cmid is not None
+            and current is not None
+        ):
+            await self.send(
+                recipient,
+                interface.text,
+                interface,
+                keyboard=interface.kb,
+                attachments=interface.attachments,
+                reply_to=context.metadata._message_cmid,
+            )
+            await self.delete(current)
+            return
+
+        if current is not None and (
+            not same_event
+            or (context is not None and context.metadata.event_type == "message_event")
+        ):
+            await self.edit(
+                current,
+                interface.text,
+                interface,
+                keyboard=interface.kb,
+                attachments=interface.attachments,
+            )
+            return
+
+        await self.send(
+            recipient,
+            interface.text,
+            interface,
+            keyboard=interface.kb,
+            attachments=interface.attachments,
+        )
 
     async def _remember_interface(self, interface_id: VKMessageInterfaceId) -> None:
         index_key = _peer_index_key(interface_id.group_id, interface_id.peer_id)
@@ -162,9 +295,6 @@ class VKMessagesAdapter(Adapter, ABC):
                 await self.app.storage.delete(index_key)
             return latest
 
-    def _mark_current_interface(self, interface_id: VKMessageInterfaceId) -> None:
-        return None
-
 
 class VKCallbackAdapter(Adapter, ABC):
     """Абстрактная обработка Callback API на типизированных событиях vkx."""
@@ -194,16 +324,14 @@ class VKCallbackAdapter(Adapter, ABC):
         self.callback_server = callback_server
         self.confirmation_code = confirmation_code
         self.dm_latest_interface = dm_latest_interface
-        self._callback_interface: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-            f"vkuxt_vk_mount_{id(self)}", default=None
-        )
-        self._callback_changed: contextvars.ContextVar[bool] = contextvars.ContextVar(
-            f"vkuxt_vk_changed_{id(self)}", default=False
+        self._vk_event_context: contextvars.ContextVar[_VKDispatchContext | None] = (
+            contextvars.ContextVar(f"vkuxt_vk_event_{id(self)}", default=None)
         )
 
-        async def confirmation(app: App, input: Input) -> str | None:
-            if not isinstance(input.metadata, _VKConfirmationMetadata):
-                return None
+        async def confirmation(
+            app: App,
+            input: Input[None, _VKConfirmationMetadata],
+        ) -> str | None:
             if input.metadata.group_id != self.group_id:
                 return None
             return self.confirmation_code or getattr(
@@ -270,15 +398,14 @@ class VKCallbackAdapter(Adapter, ABC):
             if candidate_interface_id is not None
             else None
         )
-        interface_id = candidate_interface_id if interface_record is not None else None
         metadata = VKMessageMetadata(
             event_type="message_event",
             group_id=self.group_id,
             peer_id=int(peer_id),
             user_id=int(user_id),
-            cmid=int(cmid) if cmid is not None else None,
             event_id=str(event_id),
         )
+        metadata._interface_cmid = int(cmid) if cmid is not None else None
         action_data = None
         if isinstance(payload, str):
             try:
@@ -297,7 +424,6 @@ class VKCallbackAdapter(Adapter, ABC):
         return Input(
             metadata,
             data=action_data,
-            interface_id=interface_id,
         )
 
     async def _parse_message_new(self, event: Any) -> Input | None:
@@ -309,53 +435,66 @@ class VKCallbackAdapter(Adapter, ABC):
         cmid = message.conversation_message_id
         reply = message.reply_message
         reply_cmid = getattr(reply, "conversation_message_id", None)
-        interface_id = None
-        if reply_cmid is not None:
-            candidate_interface_id = VKMessageInterfaceId(
-                cmid=int(reply_cmid), peer_id=peer_id, group_id=self.group_id
-            )
-            if await self.app.get_interface(candidate_interface_id) is not None:
-                interface_id = candidate_interface_id
-        elif self.dm_latest_interface and peer_id == user_id:
-            interface_id = await self._latest_interface(peer_id)
         metadata = VKMessageMetadata(
             event_type="message_new",
             group_id=self.group_id,
             peer_id=peer_id,
             user_id=user_id,
-            cmid=int(cmid) if cmid is not None else None,
+            msg=message,
         )
-        return Input(metadata, text=message.text or "", interface_id=interface_id)
+        metadata._message_cmid = int(cmid) if cmid is not None else None
+        metadata._reply_cmid = int(reply_cmid) if reply_cmid is not None else None
+        return Input(metadata, text=message.text or "")
 
     async def dispatch_input(self, event: Input) -> Any:
-        if (
-            not isinstance(event.metadata, VKMessageMetadata)
-            or event.metadata.event_type != "message_event"
-        ):
+        if not isinstance(event.metadata, VKMessageMetadata):
             return await super().dispatch_input(event)
         metadata = event.metadata
-        mount_token = self._callback_interface.set(
-            encode_key(event.interface_id) if event.interface_id is not None else None
+        interface_id = None
+        is_reply = metadata.event_type == "message_new" and metadata._reply_cmid is not None
+        target_cmid = (
+            metadata._interface_cmid
+            if metadata.event_type == "message_event"
+            else metadata._reply_cmid
         )
-        changed_token = self._callback_changed.set(False)
+        if target_cmid is not None:
+            candidate = VKMessageInterfaceId(
+                cmid=target_cmid,
+                peer_id=metadata.peer_id,
+                group_id=metadata.group_id,
+            )
+            if await self.app.get_interface(candidate) is not None:
+                interface_id = candidate
+        elif (
+            metadata.event_type == "message_new"
+            and self.dm_latest_interface
+            and metadata.peer_id == metadata.user_id
+        ):
+            interface_id = await self._latest_interface(metadata.peer_id)
+
+        context = _VKDispatchContext(metadata, interface_id, is_reply)
+        context_token = self._vk_event_context.set(context)
         try:
             return await super().dispatch_input(event)
         finally:
-            changed = self._callback_changed.get()
             try:
-                if not changed and metadata.event_id is not None:
+                if (
+                    metadata.event_type == "message_event"
+                    and not context.callback_changed
+                    and metadata.event_id is not None
+                ):
                     await self._answer_callback(
                         metadata.event_id,
                         metadata.peer_id,
                         metadata.user_id,
                     )
             finally:
-                self._callback_changed.reset(changed_token)
-                self._callback_interface.reset(mount_token)
+                self._vk_event_context.reset(context_token)
 
     def _mark_current_interface(self, interface_id: VKMessageInterfaceId) -> None:
-        if self._callback_interface.get() == encode_key(interface_id):
-            self._callback_changed.set(True)
+        context = self._vk_event_context.get()
+        if context is not None and context.interface_id == interface_id:
+            context.callback_changed = True
 
     @abstractmethod
     async def _answer_callback(self, event_id: str, peer_id: int, user_id: int) -> None:

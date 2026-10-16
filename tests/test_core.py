@@ -10,11 +10,13 @@ from starlette.applications import Starlette
 from vkuxt import (
     Adapter,
     App,
+    BaseMetadata,
     Input,
     InputData,
-    InputMetadata,
     JSONFileStorage,
     MemoryStorage,
+    StateStorage,
+    StopHandlerChain,
     decode_key,
     encode_key,
     storage_key,
@@ -26,7 +28,7 @@ class AccountKey(BaseModel):
     scope: str
 
 
-class EchoMetadata(InputMetadata):
+class EchoMetadata(BaseMetadata):
     user_id: int
 
 
@@ -123,6 +125,10 @@ def test_handlers_receive_input_data_and_long_payload_tokens_persist(tmp_path) -
 
 
 def test_state_storage_models_and_ttl() -> None:
+    assert isinstance(MemoryStorage(), StateStorage)
+    with pytest.raises(TypeError):
+        StateStorage()
+
     async def scenario() -> None:
         app = App(MemoryStorage(), ttl=0.02)
         key = {"owner": 1, "kind": "counter"}
@@ -228,7 +234,7 @@ def test_app_owns_adapter_lifecycle_through_starlette_lifespan() -> None:
 
 
 def test_raw_input_tries_adapters_in_order_and_passes_input_to_handlers() -> None:
-    class OtherMetadata(InputMetadata):
+    class OtherMetadata(BaseMetadata):
         pass
 
     class ParserAdapter(Adapter):
@@ -296,6 +302,58 @@ def test_raw_input_tries_adapters_in_order_and_passes_input_to_handlers() -> Non
     asyncio.run(scenario())
 
 
+def test_handlers_are_indexed_by_metadata_and_validate_data_models() -> None:
+    class OtherMetadata(BaseMetadata):
+        source: str
+
+    class StartData(InputData):
+        action: Literal["start"]
+        count: int
+
+    class StopData(InputData):
+        action: Literal["stop"]
+        reason: str
+
+    async def scenario() -> None:
+        app = App()
+        received: list[tuple[InputData, BaseMetadata, str | None]] = []
+        text_events: list[Input] = []
+
+        @app.handler(background=False)
+        async def actions(
+            app: App,
+            event: Input[StartData | StopData, EchoMetadata | OtherMetadata],
+        ) -> None:
+            received.append((event.data, event.metadata, event.text))
+
+        @app.handler(background=False)
+        async def text_only(app: App, event: Input[None, BaseMetadata]) -> None:
+            text_events.append(event)
+
+        await app.dispatch_event(
+            Input(EchoMetadata(user_id=1), data={"action": "start", "count": "3"}, text="go")
+        )
+        await app.dispatch_event(
+            Input(OtherMetadata(source="other"), data={"action": "stop", "reason": "done"})
+        )
+        await app.dispatch_event(
+            Input(EchoMetadata(user_id=1), data={"action": "unknown"})
+        )
+        await app.dispatch_event(Input(EchoMetadata(user_id=2), text="hello"))
+
+        assert len(received) == 2
+        assert isinstance(received[0][0], StartData)
+        assert received[0][0].count == 3
+        assert received[0][2] == "go"
+        assert isinstance(received[1][0], StopData)
+        assert isinstance(received[1][1], OtherMetadata)
+        assert len(text_events) == 1
+        assert text_events[0].text == "hello"
+        await app.close()
+
+    asyncio.run(scenario())
+
+
 def test_add_handler_does_not_validate_handler_signature() -> None:
     async def scenario() -> None:
         app = App()
@@ -342,7 +400,7 @@ def test_foreground_handlers_short_circuit_before_background_handlers() -> None:
     asyncio.run(scenario())
 
 
-def test_background_handlers_run_sequentially_and_stop_iteration_stops_them() -> None:
+def test_background_handlers_stop_with_stop_handler_chain() -> None:
     async def scenario() -> None:
         app = App()
         calls: list[str] = []
@@ -358,7 +416,7 @@ def test_background_handlers_run_sequentially_and_stop_iteration_stops_them() ->
         @app.handler(background=True)
         async def stop(app: App, input: Input) -> None:
             calls.append("stop")
-            raise StopIteration
+            raise StopHandlerChain
 
         @app.handler(background=True)
         async def last(app: App, input: Input) -> None:
@@ -375,7 +433,7 @@ def test_background_handlers_run_sequentially_and_stop_iteration_stops_them() ->
         @stopped_app.handler(background=False)
         async def stop_foreground(app: App, input: Input) -> None:
             stopped_calls.append("stop")
-            raise StopIteration
+            raise StopHandlerChain
 
         @stopped_app.handler(background=False)
         async def skipped_foreground(app: App, input: Input) -> None:

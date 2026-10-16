@@ -5,18 +5,22 @@ import json
 from inspect import isabstract
 from typing import Literal
 
+from vkx.models import Message
 from vkx.server import CallbackServer
 
 from vkuxt import (
     App,
+    BaseMetadata,
     Input,
     InputData,
     MemoryStorage,
     VKCallbackAdapter,
+    VKMessageInput,
     VKMessageInterfaceId,
     VKMessageMetadata,
     VKMessagesAdapter,
     VKMessagesCallbackAdapter,
+    VKMessageTemplate,
 )
 
 
@@ -40,6 +44,7 @@ class FakeMessages:
         self.answers: list[dict] = []
         self.edits: list[dict] = []
         self.sent: list[dict] = []
+        self.deletions: list[dict] = []
 
     async def send(self, **kwargs) -> list[list[dict[str, int]]]:
         self.sent.append(kwargs)
@@ -54,6 +59,7 @@ class FakeMessages:
         return True
 
     async def delete(self, **kwargs) -> list[bool]:
+        self.deletions.append(kwargs)
         return [True]
 
 
@@ -103,26 +109,16 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
         app = App(MemoryStorage())
         vk = FakeVK()
         app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
-        received: list[
-            tuple[VKMessageMetadata, str | None, StartInput | None, VKMessageInterfaceId | None]
-        ] = []
+        received: list[tuple[VKMessageMetadata, str | None, StartInput | None]] = []
         logged: list[tuple[str | None, InputData | None]] = []
         other_calls: list[OtherStartInput] = []
 
         @app.handler(background=False)
         async def start(
             app: App,
-            input: Input,
+            input: Input[StartInput | None, VKMessageMetadata],
         ) -> None:
-            if not isinstance(input.metadata, VKMessageMetadata):
-                return
-            data = None
-            if input.data is not None:
-                try:
-                    data = StartInput.model_validate(input.data.model_dump())
-                except ValueError:
-                    return
-            received.append((input.metadata, input.text, data, input.interface_id))
+            received.append((input.metadata, input.text, input.data))
 
         @app.handler(background=False)
         async def log_input(app: App, input: Input) -> None:
@@ -157,7 +153,8 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
         assert received[-1][0].group_id == 71
         assert received[-1][0].user_id == 5
         assert received[-1][0].event_type == "message_event"
-        assert received[-1][3] is None
+        assert received[-1][0].msg is None
+        assert "cmid" not in received[-1][0].model_dump()
         assert isinstance(logged[-1][1], InputData)
         assert logged[-1][1].model_dump()["source"] == "button"
         assert other_calls == []
@@ -184,7 +181,9 @@ def test_same_handler_receives_typed_callback_and_plain_text() -> None:
         assert received[-1][2] is None
         assert received[-1][0].peer_id == 5
         assert received[-1][0].event_type == "message_new"
-        assert received[-1][3] is None
+        assert isinstance(received[-1][0].msg, Message)
+        assert received[-1][0].msg.text == "начать"
+        assert "cmid" not in received[-1][0].model_dump()
         assert logged[-1] == ("начать", None)
         await app.close()
 
@@ -196,16 +195,14 @@ def test_only_oversized_button_payloads_are_tokenized() -> None:
         app = App(MemoryStorage())
         vk = FakeVK()
         adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
-        received: list[tuple[StartInput, VKMessageInterfaceId | None]] = []
+        received: list[StartInput] = []
 
         @app.handler(background=False)
-        async def start(app: App, input: Input) -> None:
+        async def start(app: App, input: VKMessageInput) -> None:
             if input.data is None:
                 return
             try:
-                received.append(
-                    (StartInput.model_validate(input.data.model_dump()), input.interface_id)
-                )
+                received.append(StartInput.model_validate(input.data.model_dump()))
             except ValueError:
                 return
 
@@ -230,8 +227,7 @@ def test_only_oversized_button_payloads_are_tokenized() -> None:
             },
         }
         await app.handle_input(callback)
-        assert received[-1][0].source == "x" * 300
-        assert received[-1][1] == interface_id
+        assert received[-1].source == "x" * 300
 
         disabled = App(tokenize_long_input=False)
         assert isinstance(
@@ -251,23 +247,14 @@ def test_callback_ack_is_skipped_when_pressed_interface_is_edited() -> None:
         adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
 
         @app.handler(background=False)
-        async def edit(app: App, input: Input) -> None:
-            if (
-                not isinstance(input.metadata, VKMessageMetadata)
-                or not isinstance(input.interface_id, VKMessageInterfaceId)
-                or input.data is None
-            ):
+        async def edit(app: App, input: VKMessageInput) -> None:
+            if input.data is None:
                 return
             try:
                 EditInput.model_validate(input.data.model_dump())
             except ValueError:
                 return
-            await adapter.edit(
-                input.interface_id,
-                "updated",
-                app.new_interface(),
-                keyboard='{"buttons":[]}',
-            )
+            await adapter.transition(adapter.new_interface(text="updated", kb='{"buttons":[]}'))
 
         message_id = VKMessageInterfaceId(cmid=10, peer_id=2000000001, group_id=71)
         await app.register_interface(message_id, app.new_interface())
@@ -290,6 +277,116 @@ def test_callback_ack_is_skipped_when_pressed_interface_is_edited() -> None:
         payload["object"]["event_id"] = "event-2"
         await app.handle_input(payload)
         assert [answer["event_id"] for answer in vk.messages.answers] == ["event-2"]
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_vk_adapter_handler_filters_non_vk_metadata() -> None:
+    class OtherMetadata(BaseMetadata):
+        pass
+
+    async def scenario() -> None:
+        app = App()
+        adapter = app.add_adapter(VKMessagesCallbackAdapter, FakeVK(), group_id=71)
+        received: list[VKMessageInput] = []
+
+        @app.handler(background=False)
+        async def handler(app: App, input: VKMessageInput) -> None:
+            received.append(input)
+
+        await app.dispatch_event(Input(OtherMetadata()))
+        assert received == []
+
+        await adapter.dispatch_input(
+            Input(
+                VKMessageMetadata(
+                    event_type="message_new",
+                    group_id=71,
+                    peer_id=5,
+                    user_id=5,
+                ),
+                text="hello",
+            )
+        )
+        assert len(received) == 1
+        assert isinstance(received[0].metadata, VKMessageMetadata)
+        assert not hasattr(received[0], "interface_id")
+        assert not hasattr(received[0].metadata, "cmid")
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_transition_replies_to_text_and_replaces_replied_interface() -> None:
+    async def scenario() -> None:
+        app = App(MemoryStorage())
+        vk = FakeVK()
+        adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
+        old = await adapter.send(5, "prompt", adapter.new_interface(text="prompt"))
+        templates: list[VKMessageTemplate] = []
+
+        @app.handler(background=False)
+        async def advance(app: App, input: VKMessageInput) -> None:
+            template = adapter.new_interface(
+                text="x" * 4097,
+                attachments=["photo1_2", "doc3_4"],
+                kb='{"buttons":[]}',
+            )
+            templates.append(template)
+            await adapter.transition(template)
+
+        metadata = VKMessageMetadata(
+            event_type="message_new",
+            group_id=71,
+            peer_id=5,
+            user_id=5,
+        )
+        metadata._message_cmid = 44
+        metadata._reply_cmid = old.cmid
+        await adapter.dispatch_input(Input(metadata, text="next"))
+
+        assert len(templates[0].text) == 4096
+        sent = vk.messages.sent[-1]
+        assert sent["message"] == "x" * 4096
+        assert sent["attachment"] == ["photo1_2", "doc3_4"]
+        assert sent["keyboard"] == '{"buttons":[]}'
+        assert sent["reply_to"] == 44
+        assert vk.messages.deletions[-1]["cmids"] == [old.cmid]
+        assert await app.get_interface(old) is None
+        assert (
+            await app.get_interface(VKMessageInterfaceId(cmid=92, peer_id=5, group_id=71))
+            is not None
+        )
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_transition_without_existing_interface_sends_new_message() -> None:
+    async def scenario() -> None:
+        app = App(MemoryStorage())
+        vk = FakeVK()
+        adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=71)
+
+        @app.handler(background=False)
+        async def show(app: App, input: VKMessageInput) -> None:
+            await adapter.transition(adapter.new_interface(text="new screen"))
+
+        metadata = VKMessageMetadata(
+            event_type="message_new",
+            group_id=71,
+            peer_id=5,
+            user_id=5,
+        )
+        metadata._message_cmid = 22
+        await adapter.dispatch_input(Input(metadata, text="start"))
+
+        assert len(vk.messages.sent) == 1
+        assert vk.messages.sent[0]["message"] == "new screen"
+        assert vk.messages.sent[0]["reply_to"] is None
+        assert vk.messages.edits == []
+        assert vk.messages.deletions == []
         await app.close()
 
     asyncio.run(scenario())

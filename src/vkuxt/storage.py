@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,18 +15,23 @@ class StorageItem:
     expires_at: float | None
 
 
-@runtime_checkable
-class StateStorage(Protocol):
+class StateStorage(ABC):
+    """Abstract base for asynchronous state-storage backends."""
+
+    @abstractmethod
     async def get(self, key: str) -> str | None: ...
 
+    @abstractmethod
     async def set(self, key: str, value: str, *, ttl: float | None = None) -> None: ...
 
+    @abstractmethod
     async def delete(self, key: str) -> None: ...
 
+    @abstractmethod
     async def cleanup_expired(self) -> None: ...
 
 
-class MemoryStorage:
+class MemoryStorage(StateStorage):
     def __init__(self) -> None:
         self._items: dict[str, StorageItem] = {}
         self._lock = asyncio.Lock()
@@ -68,7 +73,7 @@ class MemoryStorage:
             del self._items[key]
 
 
-class JSONFileStorage:
+class JSONFileStorage(StateStorage):
     """Однопроцессное JSON-хранилище с атомарной заменой файла."""  # noqa: RUF002
 
     def __init__(self, path: str | Path) -> None:
@@ -140,7 +145,7 @@ class JSONFileStorage:
         temporary.replace(self.path)
 
 
-class RedisStorage:
+class RedisStorage(StateStorage):
     """Адаптер для async Redis-клиента без жёсткой зависимости на redis-py."""
 
     def __init__(self, client: object) -> None:

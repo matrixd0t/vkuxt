@@ -1,11 +1,22 @@
 from .adapters import (
     VKCallbackAdapter,
+    VKMessageInput,
     VKMessageInterfaceId,
     VKMessageMetadata,
     VKMessagesAdapter,
     VKMessagesCallbackAdapter,
+    VKMessageTemplate,
 )
-from .app import Adapter, App, InputMetadata, Input, InputData, InputModel, StructuredInput
+from .app import (
+    Adapter,
+    App,
+    BaseMetadata,
+    Input,
+    InputData,
+    InputModel,
+    StopHandlerChain,
+    StructuredInput,
+)
 from .codec import decode_key, encode_key, key_data, storage_key
 from .interfaces import DEFAULT_TTL, Interface, InterfaceRecord
 from .storage import JSONFileStorage, MemoryStorage, RedisStorage, StateStorage, StorageItem
@@ -14,7 +25,7 @@ __all__ = [
     "DEFAULT_TTL",
     "Adapter",
     "App",
-    "InputMetadata",
+    "BaseMetadata",
     "Input",
     "InputData",
     "InputModel",
@@ -24,11 +35,14 @@ __all__ = [
     "MemoryStorage",
     "RedisStorage",
     "StateStorage",
+    "StopHandlerChain",
     "StorageItem",
     "StructuredInput",
     "VKCallbackAdapter",
+    "VKMessageInput",
     "VKMessageInterfaceId",
     "VKMessageMetadata",
+    "VKMessageTemplate",
     "VKMessagesAdapter",
     "VKMessagesCallbackAdapter",
     "decode_key",

@@ -3,22 +3,35 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import types
 from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Any, Self, TypeVar, cast, overload
+from typing import (
+    Annotated,
+    Any,
+    Self,
+    TypeAliasType,
+    TypeVar,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+    get_type_hints,
+    overload,
+)
 
 from matrix_planner import Planner, every
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from .codec import storage_key
 from .interfaces import DEFAULT_TTL, Interface, InterfaceRecord, TTLValue, _DefaultTTL
 from .locks import KeyedLockPool
 from .storage import MemoryStorage, StateStorage
 
-InputT = TypeVar("InputT", bound="InputModel")
 StateT = TypeVar("StateT")
 AdapterT = TypeVar("AdapterT", bound="Adapter")
+InputT = TypeVar("InputT", bound="InputModel")
 Handler = Callable[..., Any]
 
 
@@ -54,26 +67,24 @@ class InputData(StructuredInput):
     model_config = ConfigDict(extra="allow", validate_assignment=True)
 
 
-class InputMetadata(InputModel):
-    """Метаданные события, специфичные для адаптера."""
+class BaseMetadata(InputModel):
+    """Базовый тип для метаданных, предоставляемых адаптерами."""
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class Input:
-    metadata: InputMetadata
-    data: InputData | None
+class Input[DataT, MetadataT: BaseMetadata]:
+    data: DataT
+    metadata: MetadataT
     text: str | None
-    interface_id: Any | None
 
     def __init__(
         self,
-        metadata: InputMetadata,
+        metadata: MetadataT,
         data: InputData | Mapping[str, Any] | None = None,
         text: str | None = None,
-        interface_id: Any | None = None,
     ) -> None:
-        if not isinstance(metadata, InputMetadata):
-            raise TypeError("metadata должен быть InputMetadata")
+        if not isinstance(metadata, BaseMetadata):
+            raise TypeError("metadata должен быть BaseMetadata")
         if isinstance(data, Mapping):
             data = InputData.model_validate(data)
         elif data is not None and not isinstance(data, InputData):
@@ -83,7 +94,6 @@ class Input:
         object.__setattr__(self, "metadata", metadata)
         object.__setattr__(self, "data", data)
         object.__setattr__(self, "text", text)
-        object.__setattr__(self, "interface_id", interface_id)
 
 
 class Adapter:
@@ -110,6 +120,13 @@ class Adapter:
 class _HandlerEntry:
     background: bool
     function: Handler
+    order: int
+    data_models: tuple[type[InputData], ...] | None
+    accepts_missing_data: bool
+
+
+class StopHandlerChain(Exception):
+    """Остановить вызов следующих хендлеров в текущей фазе."""
 
 
 class App:
@@ -129,6 +146,8 @@ class App:
         self.planner = planner if planner is not None else Planner()
         self._owns_planner = planner is None
         self._handlers: list[_HandlerEntry] = []
+        self._handlers_by_metadata: dict[type[BaseMetadata], list[_HandlerEntry]] = {}
+        self._handlers_without_metadata_filter: list[_HandlerEntry] = []
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._locks = KeyedLockPool()
         self.services: dict[str, Any] = {}
@@ -179,7 +198,22 @@ class App:
         return adapter
 
     def add_handler(self, function: Handler, *, background: bool = True) -> Handler:
-        self._handlers.append(_HandlerEntry(background, function))
+        localns = _caller_localns(function)
+        annotation = _handler_input_annotation(function, localns)
+        metadata_types, data_models, accepts_missing_data = _handler_input_types(annotation)
+        entry = _HandlerEntry(
+            background=background,
+            function=function,
+            order=len(self._handlers),
+            data_models=data_models,
+            accepts_missing_data=accepts_missing_data,
+        )
+        self._handlers.append(entry)
+        if metadata_types is None:
+            self._handlers_without_metadata_filter.append(entry)
+        else:
+            for metadata_type in metadata_types:
+                self._handlers_by_metadata.setdefault(metadata_type, []).append(entry)
         return function
 
     @overload
@@ -194,42 +228,66 @@ class App:
         return self.add_handler(function, background=background)
 
     async def dispatch_event(self, _input: Input) -> Any:
-        entries = tuple(self._handlers)
+        entries = self._matching_handlers(_input.metadata)
         for entry in entries:
             if not entry.background:
+                handler_input = self._input_for_handler(entry, _input)
+                if handler_input is None:
+                    continue
                 try:
-                    result = await self._invoke(entry, _input)
-                except StopIteration:
+                    result = await self._invoke(entry, handler_input)
+                except StopHandlerChain:
                     break
-                except RuntimeError as exc:
-                    # PEP 479 wraps StopIteration raised inside async handlers.
-                    if isinstance(exc.__cause__, StopIteration):
-                        break
-                    raise
                 if result is not None:
                     return result
 
-        background_entries = tuple(entry for entry in entries if entry.background)
+        background_entries = []
+        for entry in entries:
+            if not entry.background:
+                continue
+            handler_input = self._input_for_handler(entry, _input)
+            if handler_input is not None:
+                background_entries.append((entry, handler_input))
         if background_entries:
-            task = asyncio.create_task(self._run_background_handlers(background_entries, _input))
+            task = asyncio.create_task(self._run_background_handlers(tuple(background_entries)))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_task_done)
         return None
 
     async def _run_background_handlers(
         self,
-        entries: tuple[_HandlerEntry, ...],
-        _input: Input,
+        entries: tuple[tuple[_HandlerEntry, Input], ...],
     ) -> None:
-        for entry in entries:
+        for entry, handler_input in entries:
             try:
-                await self._invoke(entry, _input)
-            except StopIteration:
+                await self._invoke(entry, handler_input)
+            except StopHandlerChain:
                 return
-            except RuntimeError as exc:
-                if isinstance(exc.__cause__, StopIteration):
-                    return
-                raise
+
+    def _matching_handlers(self, metadata: BaseMetadata) -> tuple[_HandlerEntry, ...]:
+        entries = {entry.order: entry for entry in self._handlers_without_metadata_filter}
+        for metadata_type in type(metadata).__mro__:
+            for entry in self._handlers_by_metadata.get(metadata_type, ()):
+                entries[entry.order] = entry
+        return tuple(sorted(entries.values(), key=lambda entry: entry.order))
+
+    @staticmethod
+    def _input_for_handler(entry: _HandlerEntry, event: Input) -> Input | None:
+        if entry.data_models is None:
+            return event
+        if event.data is None:
+            if entry.accepts_missing_data:
+                return event
+            return None
+
+        payload = event.data.model_dump(mode="python")
+        for model in entry.data_models:
+            try:
+                data = model.model_validate(payload)
+            except ValidationError:
+                continue
+            return Input(event.metadata, data=data, text=event.text)
+        return None
 
     def _background_task_done(self, task: asyncio.Task[Any]) -> None:
         self._background_tasks.discard(task)
@@ -417,6 +475,118 @@ class App:
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         await self.close()
+
+
+def _caller_localns(function: Handler) -> dict[str, Any]:
+    localns: dict[str, Any] = {}
+    with suppress(TypeError):
+        localns.update(inspect.getclosurevars(function).nonlocals)
+
+    frame = inspect.currentframe()
+    frames = []
+    try:
+        frame = frame.f_back if frame is not None else None
+        while frame is not None:
+            frames.append(frame)
+            frame = frame.f_back
+        for frame in reversed(frames):
+            localns.update(frame.f_locals)
+    finally:
+        del frame
+    return localns
+
+
+def _handler_input_annotation(function: Handler, localns: dict[str, Any]) -> Any:
+    try:
+        parameters = [
+            parameter
+            for parameter in inspect.signature(function).parameters.values()
+            if parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+    except (TypeError, ValueError):
+        return inspect.Signature.empty
+    if not parameters:
+        return inspect.Signature.empty
+    parameter = parameters[1] if len(parameters) > 1 else parameters[0]
+    annotation = parameter.annotation
+    if annotation is inspect.Signature.empty:
+        return annotation
+
+    try:
+        hints = get_type_hints(
+            function,
+            globalns=getattr(function, "__globals__", {}),
+            localns=localns,
+        )
+    except (NameError, TypeError):
+        if isinstance(annotation, str):
+            try:
+                return eval(annotation, getattr(function, "__globals__", {}), localns)
+            except (NameError, SyntaxError, TypeError):
+                return annotation
+        return annotation
+    return hints.get(parameter.name, annotation)
+
+
+def _expand_type_alias(annotation: Any) -> Any:
+    while isinstance(annotation, TypeAliasType):
+        annotation = annotation.__value__
+    return annotation
+
+
+def _type_alternatives(annotation: Any) -> tuple[Any, ...]:
+    annotation = _expand_type_alias(annotation)
+    if get_origin(annotation) is Annotated:
+        return _type_alternatives(get_args(annotation)[0])
+    if get_origin(annotation) in (Union, types.UnionType):
+        return tuple(
+            alternative
+            for member in get_args(annotation)
+            for alternative in _type_alternatives(member)
+        )
+    return (annotation,)
+
+
+def _handler_input_types(
+    annotation: Any,
+) -> tuple[tuple[type[BaseMetadata], ...] | None, tuple[type[InputData], ...] | None, bool]:
+    annotation = _expand_type_alias(annotation)
+    if annotation in (inspect.Signature.empty, Any, object, Input):
+        return None, None, True
+    if get_origin(annotation) is not Input:
+        return None, None, True
+
+    arguments = get_args(annotation)
+    if len(arguments) != 2:
+        raise TypeError("Аннотация ввода должна иметь вид Input[МодельДанных, ТипМетаданных]")
+    data_annotation, metadata_annotation = arguments
+
+    if metadata_annotation in (Any, object):
+        metadata_types = None
+    else:
+        metadata_types_list: list[type[BaseMetadata]] = []
+        for metadata_type in _type_alternatives(metadata_annotation):
+            if not isinstance(metadata_type, type) or not issubclass(metadata_type, BaseMetadata):
+                raise TypeError("Типы metadata должны наследоваться от BaseMetadata")
+            if metadata_type not in metadata_types_list:
+                metadata_types_list.append(metadata_type)
+        metadata_types = tuple(metadata_types_list)
+
+    if data_annotation in (Any, object):
+        return metadata_types, None, True
+
+    data_models: list[type[InputData]] = []
+    accepts_missing_data = False
+    for data_type in _type_alternatives(data_annotation):
+        if data_type is type(None):
+            accepts_missing_data = True
+        elif isinstance(data_type, type) and issubclass(data_type, InputData):
+            if data_type not in data_models:
+                data_models.append(data_type)
+        else:
+            raise TypeError("Типы data должны быть моделями InputData, None или Any")
+    return metadata_types, tuple(data_models), accepts_missing_data
 
 
 def _json(value: Any) -> str:
