@@ -188,31 +188,3 @@ VK Callback адаптер использует `vkx.server.CallbackServer` дл
 
 Полный скетч крестиков-ноликов, включая лобби с кодом, ввод кода ответом на сообщение, две синхронизируемые доски и сдачу, находится в [`examples/tictactoe.py`](examples/tictactoe.py).
 
-## Проверка
-
-```powershell
-uv sync --extra dev
-.venv\Scripts\python.exe -m pytest
-.venv\Scripts\python.exe -m ruff check src tests examples
-.venv\Scripts\python.exe -m pyright
-uv build
-```
-
-## Релиз
-
-Релиз идёт напрямую в `master` (в репозитории одна релизная ветка):
-
-```powershell
-.\release.ps1                      # patch: 0.1.0 -> 0.1.1
-.\release.ps1 -Bump minor          # minor: 0.1.0 -> 0.2.0
-.\release.ps1 -Version 1.0.0       # точная версия
-.\release.ps1 -SkipChecks          # пропустить локальные проверки
-```
-
-Скрипт требует `uv`, `git` и авторизованный `gh`. Он проверяет чистоту рабочего дерева и синхронизацию `master` с `origin/master`, что версия ещё не опубликована на PyPI, запускает pytest/ruff/pyright, поднимает версию, собирает пакет, коммитит и пушит `master`, затем создаёт GitHub Release. `.github/workflows/publish.yml` собирает sdist/wheel и публикует их на PyPI.
-
-Если версия уже поднята и закоммичена, но публикация не завершилась, повторите `.\release.ps1 -Version <текущая-версия>`: скрипт не будет делать новый bump, а выполнит push и GitHub Release для текущего коммита.
-
-Один раз в настройках PyPI нужно добавить trusted publisher для проекта `vkuxt`: repository `matrixd0t/vkuxt`, workflow `publish.yml`, environment `pypi`. Без этого publish-job завершится ошибкой.
-
-Для запуска примера установите FastAPI (он входит в extra `dev`), создайте `VKClient` с токеном группы, настройте публичный Callback URL, получите `app` из `await make_callback_app(...)` и передайте его в `attach_fastapi(app)`. Пример хранит лобби 15 минут, игры — час; чистые правила остаются в [`examples/tictactoe.py`](examples/tictactoe.py) и покрыты тестами.
