@@ -17,9 +17,9 @@ from vkx.models import (
     Button,
     Keyboard,
     KeyboardButton,
-    KeyboardButtonColor,
     Message,
 )
+from vkx.models import KeyboardButtonColor as KeyboardButtonColor
 from vkx.server import CallbackServer
 
 from ..app import Adapter, App, BaseMetadata, Context, Input

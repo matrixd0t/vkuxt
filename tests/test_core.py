@@ -19,6 +19,7 @@ from vkuxt import (
     InterfaceHandle,
     JSONFileStorage,
     MemoryStorage,
+    StateNamespace,
     StateStorage,
     StopHandlerChain,
     decode_key,
@@ -43,6 +44,11 @@ class EchoInput(InputData):
 
 class StoredState(BaseModel):
     count: int
+
+
+class CounterNamespace(StateNamespace):
+    count: int = 0
+    uid: int = 0
 
 
 class RecordingAdapter(Adapter):
@@ -862,7 +868,7 @@ def test_handler_context_persists_state_and_is_background_by_default() -> None:
             assert ctx.app is app
             assert ctx.adapter is adapter
             started.set()
-            ctx.state["count"] += 1
+            ctx.state.count += 1
 
         await app.dispatch_event(
             Input(EchoMetadata(user_id=1), interface=interface),
@@ -889,7 +895,7 @@ def test_context_state_is_persisted_for_events_without_interface() -> None:
             data: None,
             text: str,
         ) -> None:
-            ctx.state["seen"] = text
+            ctx.state.seen = text
 
         metadata = EchoMetadata(user_id=7)
         await app.dispatch_event(Input(metadata, text="hello"), adapter)
@@ -897,6 +903,66 @@ def test_context_state_is_persisted_for_events_without_interface() -> None:
         await app.close()
 
     asyncio.run(scenario())
+
+
+def test_typed_context_state_namespace_is_validated_and_persisted() -> None:
+    async def scenario() -> None:
+        app = App()
+        adapter = app.add_adapter(Adapter(app))
+        metadata = EchoMetadata(user_id=7)
+
+        @app.handler(background=False)
+        async def increment(
+            ctx: Context[Adapter, CounterNamespace],
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            assert isinstance(ctx.state, CounterNamespace)
+            ctx.state.count += 1
+            ctx.state.uid = metadata.user_id
+            ctx.state.note = text
+
+        await app.dispatch_event(Input(metadata, text="hello"), adapter)
+        await app.dispatch_event(Input(metadata, text="again"), adapter)
+        stored = await app.get_state(
+            adapter.context_key(metadata),
+            CounterNamespace,
+        )
+        assert stored is not None
+        assert stored.count == 2
+        assert stored.uid == 7
+        assert stored.note == "again"
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_context_state_namespace_allows_extra_json_attributes() -> None:
+    state = StateNamespace()
+    state.anything = {"value": [1, 2, 3]}
+    assert state.anything == {"value": [1, 2, 3]}
+    with pytest.raises(ValidationError):
+        state.invalid = object()
+    assert not hasattr(state, "invalid")
+    with pytest.raises(ValidationError):
+        state.anything = object()
+    assert state.anything == {"value": [1, 2, 3]}
+
+
+def test_context_state_annotation_requires_namespace_subclass() -> None:
+    app = App()
+
+    with pytest.raises(TypeError, match="StateNamespace"):
+
+        @app.handler
+        async def invalid(
+            ctx: Context[Adapter, dict],
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            return None
 
 
 def test_context_redraw_moves_state_to_new_interface() -> None:
@@ -914,7 +980,7 @@ def test_context_redraw_moves_state_to_new_interface() -> None:
             data: None,
             text: str,
         ) -> None:
-            ctx.state["count"] = 6
+            ctx.state.count = 6
             result = await ctx.redraw(Interface(text="new"))
             assert result is new
             assert ctx.interface is new
@@ -947,7 +1013,7 @@ def test_context_redraw_moves_conversation_state_to_interface() -> None:
             data: None,
             text: str,
         ) -> None:
-            assert ctx.state == {"uid": 3}
+            assert ctx.state.uid == 3
             await ctx.redraw(Interface(text="screen"))
 
         await app.dispatch_event(Input(metadata), adapter)

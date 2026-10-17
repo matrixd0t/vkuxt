@@ -6,7 +6,6 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 from vkx import VKClient
-from vkx.models import KeyboardButtonColor as col
 from vkx.server import CallbackServer, create_callback_server
 
 from vkuxt import (
@@ -15,6 +14,8 @@ from vkuxt import (
     InputData,
     InputModel,
     JSONFileStorage,
+    KeyboardButtonColor,
+    StateNamespace,
     VKInterface,
     VKMessageMetadata,
     VKMessagesCallbackAdapter,
@@ -31,7 +32,16 @@ CREATE_FAILED_VIEW = VKInterface(
     text="Не удалось создать игру. Попробуйте ещё раз.",
     ttl=LOBBY_TTL,
 )
-type VKContext = Context[VKMessagesCallbackAdapter]
+
+
+class TicTacToeState(StateNamespace):
+    uid: int = 0
+    code: str = ""
+    game_id: str = ""
+    seat: int = 0
+
+
+type VKContext = Context[VKMessagesCallbackAdapter, TicTacToeState]
 
 
 class TicTacToeInput(InputData):
@@ -112,17 +122,17 @@ def menu_view(uid: int) -> VKInterface:
                 VKInterface.callback(
                     "Создать игру",
                     CreateLobbyInput(uid=uid),
-                    color=col.POSITIVE,
+                    color=KeyboardButtonColor.POSITIVE,
                 ),
                 VKInterface.callback(
                     "Подключиться к игре",
                     AskJoinCodeInput(uid=uid),
-                    color=col.PRIMARY,
+                    color=KeyboardButtonColor.PRIMARY,
                 ),
                 VKInterface.callback(
                     "Закрыть",
                     CloseInput(uid=uid),
-                    color=col.NEGATIVE,
+                    color=KeyboardButtonColor.NEGATIVE,
                 ),
             ]
         ],
@@ -138,7 +148,7 @@ def lobby_view(code: str) -> VKInterface:
                 VKInterface.callback(
                     "Покинуть подбор",
                     LobbyActionInput(code=code),
-                    color=col.NEGATIVE,
+                    color=KeyboardButtonColor.NEGATIVE,
                 )
             ]
         ],
@@ -154,7 +164,7 @@ def join_prompt_view(uid: int) -> VKInterface:
                 VKInterface.callback(
                     "Закрыть",
                     CancelJoinInput(uid=uid),
-                    color=col.NEGATIVE,
+                    color=KeyboardButtonColor.NEGATIVE,
                 )
             ]
         ],
@@ -180,7 +190,7 @@ def game_view(game: GameState, seat: int) -> VKInterface:
                                 seat=seat,
                                 cell=cell,
                             ),
-                            color=col.PRIMARY,
+                            color=KeyboardButtonColor.PRIMARY,
                         )
                     )
                 else:
@@ -193,7 +203,7 @@ def game_view(game: GameState, seat: int) -> VKInterface:
                 VKInterface.callback(
                     "Покинуть игру",
                     SurrenderInput(game_id=game.game_id, seat=seat),
-                    color=col.NEGATIVE,
+                    color=KeyboardButtonColor.NEGATIVE,
                 )
             ]
         )
@@ -217,12 +227,12 @@ def game_view(game: GameState, seat: int) -> VKInterface:
                 VKInterface.callback(
                     "В меню",
                     BackToMenuInput(game_id=game.game_id, seat=seat),
-                    color=col.PRIMARY,
+                    color=KeyboardButtonColor.PRIMARY,
                 ),
                 VKInterface.callback(
                     "Закрыть",
                     CloseInput(uid=player.user_id),
-                    color=col.NEGATIVE,
+                    color=KeyboardButtonColor.NEGATIVE,
                 ),
             ]
         ]
@@ -231,19 +241,19 @@ def game_view(game: GameState, seat: int) -> VKInterface:
 
 
 async def menu(
-    ctx: Context,
+    ctx: VKContext,
     metadata: VKMessageMetadata,
     data: None,
     text: str,
 ) -> None:
     if text.strip().casefold() not in {"начать", "меню"}:
         return
-    ctx.state["uid"] = metadata.user_id
+    ctx.state.uid = metadata.user_id
     await ctx.redraw(menu_view(metadata.user_id))
 
 
 async def create_lobby(
-    ctx: Context,
+    ctx: VKContext,
     metadata: VKMessageMetadata,
     data: CreateLobbyInput,
     text: str,
@@ -270,22 +280,22 @@ async def create_lobby(
                 LobbyState(owner=owner),
                 ttl=LOBBY_TTL,
             )
-        ctx.state["uid"] = metadata.user_id
-        ctx.state["code"] = code
+        ctx.state.uid = metadata.user_id
+        ctx.state.code = code
         await ctx.redraw(lobby_view(code))
         return
     await ctx.redraw(CREATE_FAILED_VIEW)
 
 
 async def ask_join_code(
-    ctx: Context,
+    ctx: VKContext,
     metadata: VKMessageMetadata,
     data: AskJoinCodeInput,
     text: str,
 ) -> None:
     if data.uid != metadata.user_id:
         return
-    ctx.state["uid"] = metadata.user_id
+    ctx.state.uid = metadata.user_id
     await ctx.redraw(join_prompt_view(metadata.user_id))
 
 
@@ -335,14 +345,14 @@ async def join_code(
         await ctx.app.set_state(game_key, game, ttl=GAME_TTL)
 
     for seat, player in enumerate(game.players):
-        screen_state = {
-            "game_id": game.game_id,
-            "seat": seat,
-            "uid": player.user_id,
-        }
+        screen_state = TicTacToeState(
+            game_id=game.game_id,
+            seat=seat,
+            uid=player.user_id,
+        )
         view = game_view(game, seat)
         if player.peer_id == metadata.peer_id:
-            ctx.state.update(screen_state)
+            ctx.state = screen_state
             await ctx.redraw(view)
         else:
             handle = await ctx.adapter.redraw(view, peer_id=player.peer_id)
@@ -351,26 +361,26 @@ async def join_code(
 
 
 async def cancel_join(
-    ctx: Context,
+    ctx: VKContext,
     metadata: VKMessageMetadata,
     data: CancelJoinInput,
     text: str,
 ) -> None:
     if data.uid != metadata.user_id:
         return
-    if ctx.state.get("uid") != metadata.user_id:
+    if ctx.state.uid != metadata.user_id:
         return
     await ctx.redraw(None)
 
 
 async def abandon_lobby(
-    ctx: Context,
+    ctx: VKContext,
     metadata: VKMessageMetadata,
     data: LobbyActionInput,
     text: str,
 ) -> None:
-    code = ctx.state.get("code")
-    if not isinstance(code, str) or code != data.code:
+    code = ctx.state.code
+    if not code or code != data.code:
         return
     key = {
         "app": "ttt",
@@ -398,8 +408,8 @@ async def game_action(
     data: MoveInput | SurrenderInput,
     text: str,
 ) -> None:
-    game_id = ctx.state.get("game_id")
-    seat = ctx.state.get("seat")
+    game_id = ctx.state.game_id
+    seat = ctx.state.seat
     if game_id != data.game_id or seat != data.seat:
         return
     key = {
@@ -446,14 +456,14 @@ async def game_action(
 
         # Рендер под тем же lock'ом сохраняет порядок досок.
         for render_seat, render_player in enumerate(game.players):
-            screen_state = {
-                "game_id": game.game_id,
-                "seat": render_seat,
-                "uid": render_player.user_id,
-            }
+            screen_state = TicTacToeState(
+                game_id=game.game_id,
+                seat=render_seat,
+                uid=render_player.user_id,
+            )
             view = game_view(game, render_seat)
             if render_player.peer_id == metadata.peer_id:
-                ctx.state.update(screen_state)
+                ctx.state = screen_state
                 await ctx.redraw(view)
             else:
                 handle = await ctx.adapter.redraw(
@@ -469,12 +479,12 @@ async def game_action(
 
 
 async def back_to_menu(
-    ctx: Context,
+    ctx: VKContext,
     metadata: VKMessageMetadata,
     data: BackToMenuInput,
     text: str,
 ) -> None:
-    if ctx.state.get("game_id") != data.game_id or ctx.state.get("seat") != data.seat:
+    if ctx.state.game_id != data.game_id or ctx.state.seat != data.seat:
         return
     key = {
         "app": "ttt",
@@ -493,26 +503,25 @@ async def back_to_menu(
         or player.peer_id != metadata.peer_id
     ):
         return
-    ctx.state.clear()
-    ctx.state["uid"] = metadata.user_id
+    ctx.state = TicTacToeState(uid=metadata.user_id)
     await ctx.redraw(menu_view(metadata.user_id))
 
 
 async def close(
-    ctx: Context,
+    ctx: VKContext,
     metadata: VKMessageMetadata,
     data: CloseInput,
     text: str,
 ) -> None:
     if data.uid != metadata.user_id:
         return
-    if ctx.state.get("uid") != metadata.user_id:
+    if ctx.state.uid != metadata.user_id:
         return
     await ctx.redraw(None)
 
 
 async def noop(
-    ctx: Context,
+    ctx: VKContext,
     metadata: VKMessageMetadata,
     data: NoopInput,
     text: str,

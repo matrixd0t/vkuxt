@@ -1,4 +1,5 @@
 from .adapters import (
+    KeyboardButtonColor,
     VKCallbackAdapter,
     VKInterface,
     VKMessageInput,
@@ -11,7 +12,7 @@ from .adapters import (
 from .app import Adapter, App, Context, Input, StopHandlerChain
 from .codec import decode_key, encode_key, key_data, storage_key
 from .interfaces import DEFAULT_TTL, Interface, InterfaceHandle, InterfaceRecord
-from .models import BaseMetadata, InputData, InputModel
+from .models import BaseMetadata, InputData, InputModel, StateNamespace
 from .storage import JSONFileStorage, MemoryStorage, StateStorage
 
 __all__ = [
@@ -27,7 +28,9 @@ __all__ = [
     "InterfaceHandle",
     "InterfaceRecord",
     "JSONFileStorage",
+    "KeyboardButtonColor",
     "MemoryStorage",
+    "StateNamespace",
     "StateStorage",
     "StopHandlerChain",
     "VKCallbackAdapter",

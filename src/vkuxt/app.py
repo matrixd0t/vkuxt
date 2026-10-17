@@ -39,6 +39,7 @@ from .locks import KeyedLockPool, LockedKeys
 from .models import BaseMetadata as BaseMetadata
 from .models import InputData as InputData
 from .models import InputModel as InputModel
+from .models import StateNamespace as StateNamespace
 from .storage import MemoryStorage, StateStorage
 
 logger = logging.getLogger("vkuxt")
@@ -127,18 +128,23 @@ class Adapter:
 
 
 @dataclass(slots=True)
-class Context[AdapterT: Adapter = Adapter]:
+class Context[
+    AdapterT: Adapter = Adapter,
+    StateT: StateNamespace = StateNamespace,
+]:
     """Контекст одного хендлера: интерфейс, состояние и доступ к приложению.
 
-    ``state`` — изменяемый JSON-объект, привязанный к текущему интерфейсу.
-    После успешного завершения хендлера он сохраняется автоматически.
+    ``state`` — изменяемый JSON-namespace, привязанный к текущему интерфейсу.
+    Поля можно читать и писать как атрибуты; необъявленные атрибуты
+    сохраняются. После успешного завершения хендлера состояние сохраняется
+    автоматически. Тип namespace задаётся вторым параметром ``Context``.
     """
 
     app: App
     adapter: AdapterT
     interface: InterfaceHandle[Any] | None
     metadata: BaseMetadata
-    state: dict[str, Any]
+    state: StateT
     _state_key: KeyLike | None
     _state_ttl: TTLValue = DEFAULT_TTL
 
@@ -182,6 +188,7 @@ class _HandlerEntry:
     metadata_types: tuple[type[BaseMetadata], ...]
     data_models: tuple[type[InputData], ...]
     accepts_missing_data: bool
+    state_type: type[StateNamespace]
 
 
 class StopHandlerChain(Exception):
@@ -267,15 +274,19 @@ class App:
 
     def add_handler(self, function: Handler, *, background: bool = True) -> Handler:
         localns = _caller_localns(function)
-        metadata_types, data_models, accepts_missing_data = _handler_annotations(
-            function, localns
-        )
+        (
+            metadata_types,
+            data_models,
+            accepts_missing_data,
+            state_type,
+        ) = _handler_annotations(function, localns)
         entry = _HandlerEntry(
             background=background,
             function=function,
             metadata_types=metadata_types,
             data_models=data_models,
             accepts_missing_data=accepts_missing_data,
+            state_type=state_type,
         )
         self._handlers.append(entry)
         return function
@@ -407,7 +418,8 @@ class App:
         self,
         adapter: Adapter,
         event: Input,
-    ) -> Context[Any]:
+        state_type: type[StateNamespace],
+    ) -> Context[Any, Any]:
         interface = event.interface
         if interface is not None:
             state_key: KeyLike = interface.state_key()
@@ -415,11 +427,24 @@ class App:
         else:
             state_key = adapter.context_key(event.metadata)
             state_ttl = self.ttl
-        state = await self.get_state(state_key, dict)
-        if state is None:
-            state = {}
-        elif not isinstance(state, dict):
+        raw_state = await self.get_state(state_key)
+        if raw_state is not None and not isinstance(raw_state, dict):
             raise TypeError("Состояние контекста должно быть JSON-объектом")
+        if raw_state is None:
+            try:
+                state = state_type()
+            except ValidationError as exc:
+                raise TypeError(
+                    f"Не удалось создать состояние {state_type.__name__}; "
+                    "поля без сохранённых значений должны иметь значения по умолчанию"
+                ) from exc
+        else:
+            try:
+                state = state_type.model_validate(raw_state)
+            except ValidationError as exc:
+                raise TypeError(
+                    f"Сохранённое состояние не соответствует {state_type.__name__}"
+                ) from exc
         return Context(
             app=self,
             adapter=adapter,
@@ -437,7 +462,7 @@ class App:
         event: Input,
         data: InputData | None,
     ) -> Any:
-        context = await self._context_for(adapter, event)
+        context = await self._context_for(adapter, event, entry.state_type)
         try:
             result = entry.function(
                 context,
@@ -663,7 +688,12 @@ def _caller_localns(function: Handler) -> dict[str, Any]:
 def _handler_annotations(
     function: Handler,
     localns: dict[str, Any],
-) -> tuple[tuple[type[BaseMetadata], ...], tuple[type[InputData], ...], bool]:
+) -> tuple[
+    tuple[type[BaseMetadata], ...],
+    tuple[type[InputData], ...],
+    bool,
+    type[StateNamespace],
+]:
     try:
         all_parameters = list(inspect.signature(function).parameters.values())
         parameters = [
@@ -700,12 +730,36 @@ def _handler_annotations(
         isinstance(ctx_type, type) and issubclass(ctx_type, Context)
     ):
         raise TypeError("Аннотация ctx должна быть Context")
+    state_type = _context_state_type(ctx_annotation, ctx_type)
 
     metadata_types = _metadata_annotation_types(metadata_annotation)
     data_models, accepts_missing_data = _data_annotation_types(data_annotation)
     if _unwrap_annotation(text_annotation) is not str:
         raise TypeError("Аннотация text должна быть str")
-    return metadata_types, data_models, accepts_missing_data
+    return metadata_types, data_models, accepts_missing_data, state_type
+
+
+def _context_state_type(annotation: Any, ctx_type: Any) -> type[StateNamespace]:
+    if ctx_type in (inspect.Signature.empty, Any) or ctx_type is not Context:
+        return StateNamespace
+    arguments = get_args(annotation)
+    if len(arguments) > 2:
+        raise TypeError(
+            "Context принимает не больше двух параметров: адаптер и тип состояния"
+        )
+    if len(arguments) < 2:
+        return StateNamespace
+    state_annotation = _unwrap_annotation(arguments[1])
+    if state_annotation is Any:
+        return StateNamespace
+    if not (
+        isinstance(state_annotation, type)
+        and issubclass(state_annotation, StateNamespace)
+    ):
+        raise TypeError(
+            "Второй параметр Context должен наследоваться от StateNamespace"
+        )
+    return state_annotation
 
 
 def _expand_type_alias(annotation: Any) -> Any:

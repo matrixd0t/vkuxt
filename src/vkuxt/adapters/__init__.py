@@ -1,4 +1,5 @@
 from .vk import (
+    KeyboardButtonColor,
     VKCallbackAdapter,
     VKInterface,
     VKMessageInput,
@@ -10,6 +11,7 @@ from .vk import (
 )
 
 __all__ = [
+    "KeyboardButtonColor",
     "VKCallbackAdapter",
     "VKInterface",
     "VKMessageInput",

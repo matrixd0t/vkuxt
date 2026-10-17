@@ -6,7 +6,7 @@ from inspect import isabstract
 from typing import Literal
 
 import pytest
-from vkx.models import Button, KeyboardButtonColor, Message
+from vkx.models import Button, Message
 from vkx.server import CallbackServer
 
 from vkuxt import (
@@ -16,6 +16,7 @@ from vkuxt import (
     Input,
     InputData,
     JSONFileStorage,
+    KeyboardButtonColor,
     MemoryStorage,
     VKCallbackAdapter,
     VKInterface,
@@ -25,7 +26,12 @@ from vkuxt import (
     VKMessagesAdapter,
     VKMessagesCallbackAdapter,
 )
+from vkuxt.adapters.vk import KeyboardButtonColor as AdapterColor
 from vkuxt.adapters.vk import _peer_index_key
+
+
+def test_vk_adapter_reexports_keyboard_button_color() -> None:
+    assert AdapterColor is KeyboardButtonColor
 
 
 class StartInput(InputData):

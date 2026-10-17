@@ -17,11 +17,11 @@ uv add vkuxt                 # в приложении, когда пакет о
 
 - `App` передаёт сырой ввод адаптерам по очереди. Первый распознавший формат адаптер возвращает внутренний `Input` с полями `metadata`, `data`, `text` и `interface`; текст и typed payload могут присутствовать одновременно. Прикладной хендлер получает уже не `Input`.
 - Контракт хендлера: `(ctx, metadata, data, text)`. `ctx` — `Context`, привязанный к текущему интерфейсу; `metadata` — экземпляр `BaseMetadata`, `data` — валидированная модель `InputData` или `None`, `text` — строка (пустая, если текста нет). В аннотациях metadata и data указывается одна модель или `Union` моделей через `|`. Диспетчер пропускает хендлер, если metadata не подходит по типу или payload не валидируется ни в одну из указанных data-моделей. `data: None` означает событие без payload; `data: Model | None` принимает оба варианта. `BaseMetadata` и `InputData` в аннотации работают как широкие фильтры.
-- `ctx.state` — изменяемый JSON-объект, привязанный к текущему интерфейсу. После успешного завершения хендлера он сохраняется автоматически. `ctx.redraw(view)` перерисовывает текущий интерфейс и переносит состояние на новый handle; `ctx.redraw(None)` удаляет интерфейс и его состояние. Через `ctx` доступны `ctx.app`, `ctx.adapter`, `ctx.interface` и `ctx.metadata`. Параметризуйте `Context` типом адаптера только там, где нужен его специфичный API (`Context[VKMessagesCallbackAdapter]`); для `ctx.redraw`, `ctx.state` и `ctx.app` достаточно обычного `Context`.
+- `ctx.state` — изменяемый Pydantic-namespace `StateNamespace` с доступом по атрибутам, привязанный к текущему интерфейсу. После успешного завершения хендлера он сохраняется автоматически. `ctx.redraw(view)` перерисовывает текущий интерфейс и переносит состояние на новый handle; `ctx.redraw(None)` удаляет интерфейс и его состояние. Через `ctx` доступны `ctx.app`, `ctx.adapter`, `ctx.interface` и `ctx.metadata`. Параметризуйте `Context` типом адаптера только там, где нужен его специфичный API (`Context[VKMessagesCallbackAdapter]`); второй параметр (`Context[VKMessagesCallbackAdapter, ScreenState]`) задаёт схему состояния для IDE и валидации.
 - По умолчанию хендлеры fire-and-forget: `App.dispatch_event` только запускает их в одной `asyncio.Task` и сразу возвращает управление. `await app.wait_background()` ждёт завершения; `App.close()` также дренирует задачи. `@app.handler(background=False)` оставляет явный foreground-режим: такие хендлеры вызываются последовательно, а первый непустой результат возвращается адаптеру. `raise StopHandlerChain` прекращает текущую фазу опроса.
-- `InputData` проверяет строгую JSON-сериализуемость при Pydantic-валидации и присваивании. `handler_name` — обычное поле данных; диспетчер не интерпретирует его. Чтобы не передавать `handler_name` вручную, задайте значение по умолчанию прямо в модели: `handler_name: Literal["ttt.close"] = "ttt.close"`.
+- `InputData` и `StateNamespace` проверяют строгую JSON-сериализуемость при Pydantic-валидации и присваивании. `handler_name` — обычное поле данных; диспетчер не интерпретирует его. Чтобы не передавать `handler_name` вручную, задайте значение по умолчанию прямо в модели: `handler_name: Literal["ttt.close"] = "ttt.close"`.
 - Ключи приложения — обычные словари, dataclass'ы или Pydantic-модели. `encode_key` канонически сериализует их; данные сортируются по ключам, а тип по умолчанию кодируется полным именем класса. Для стабильного тега можно объявить `__vkuxt_key_type__: ClassVar[str]`, чтобы перенос модуля не ломал сохранённые ключи. Storage-ключи версионированы (`vkuxt:v1:...`); ключи предыдущих alpha-версий без `v1` не читаются.
-- Аннотации хендлера разрешаются при регистрации. Неразрешимое имя, неверное число аргументов, `ctx` не `Context`, metadata не из `BaseMetadata`, data не из `InputData`/`None` или `text` не `str` приводят к `TypeError`, а не к тихому превращению хендлера в wildcard. Ошибки фоновых хендлеров и запуска адаптеров пишутся в `logging.getLogger("vkuxt")`.
+- Аннотации хендлера разрешаются при регистрации. Неразрешимое имя, неверное число аргументов, `ctx` не `Context`, второй параметр `Context` не из `StateNamespace`, metadata не из `BaseMetadata`, data не из `InputData`/`None` или `text` не `str` приводят к `TypeError`, а не к тихому превращению хендлера в wildcard. Ошибки фоновых хендлеров и запуска адаптеров пишутся в `logging.getLogger("vkuxt")`.
 - `Interface` — общий контракт отрисовываемого экрана: `text` и двумерный список кнопок. Адаптер объявляет свой подкласс через `Adapter.interface_type`; для VK это `VKInterface`, который проверяет лимиты сообщения и inline-клавиатуры.
 - Конкретный удалённый интерфейс представлен `InterfaceHandle` — Python-объектом с непрозрачным `id`, который не меняется при перерисовках. Прикладной код передаёт handle в `Adapter.redraw()` и не работает с `cmid`/peer-id напрямую. Входящий интерфейс доступен хендлеру как `ctx.interface`; `ctx.redraw(view)` рисует именно его.
 - Callback-payload'ы кладутся в кнопки обычными `InputData` или словарями. Адаптер сам сериализует их и заменяет payload длиннее 255 байт UTF-8 коротким token; token'ы хранятся в записи интерфейса. `App(tokenize_long_input=False)` отключает замену.
@@ -64,7 +64,7 @@ async def greeting(
         message = text
     else:
         return
-    ctx.state["last"] = message
+    ctx.state.last = message
     await ctx.redraw(
         VKInterface(
             text=f"{message}, {metadata.user_id}",
@@ -106,7 +106,33 @@ await ctx.redraw(None)                        # удалить текущий
 
 Redis-бэкенд намеренно не входит в библиотеку: прикладной слой может реализовать `StateStorage` под свой клиент. Pydantic-модели состояния сохраняются как JSON; тип модели передаётся в `get_state(key, Model)`. Обычные dict/list/scalars можно читать без модели, для словаря явно передайте `dict`. `App(ttl=...)` задаёт TTL по умолчанию; у отдельного интерфейса он переопределяется через `VKInterface(ttl=...)` или `adapter.new_interface(ttl=...)`. `None` означает без срока жизни. `matrix-planner` периодически вызывает обязательный `cleanup_expired()`.
 
-`ctx.state` — обычный JSON-объект, который автоматически сохраняется после успешного хендлера. При наличии интерфейса он хранится под стабильным `InterfaceHandle.state_key()`; при событии без интерфейса используется ключ `Adapter.context_key(metadata)`. `ctx.redraw(view)` переносит состояние на новый handle, а `ctx.redraw(None)` удаляет его вместе с интерфейсом. Для общего состояния, разделяемого несколькими интерфейсами (например, партии на двух досках), по-прежнему используйте `app.get_state`/`app.set_state`; это необязательное удобство, прикладной слой может хранить такие данные где угодно. Сам handle как ключ использовать нельзя: его `actions` и `ttl` меняются. Внутренние записи интерфейсов vkuxt хранит под непрозрачными ID адаптера, чтобы переживать перерисовки и длинные callback-payload'ы.
+`ctx.state` — изменяемый Pydantic-namespace `StateNamespace`, а не словарь. Поля читаются и пишутся как атрибуты, объявленные в подклассе поля видны IDE и валидируются при присваивании, а необъявленные атрибуты разрешены и сохраняются как extra-поля. Значения обязаны сериализоваться в строгий JSON; проверка выполняется при каждом присваивании. Состояние автоматически сохраняется после успешного хендлера. При наличии интерфейса оно хранится под стабильным `InterfaceHandle.state_key()`; при событии без интерфейса используется ключ `Adapter.context_key(metadata)`. `ctx.redraw(view)` переносит состояние на новый handle, а `ctx.redraw(None)` удаляет его вместе с интерфейсом. Для общего состояния, разделяемого несколькими интерфейсами (например, партии на двух досках), по-прежнему используйте `app.get_state`/`app.set_state`; это необязательное удобство, прикладной слой может хранить такие данные где угодно. Сам handle как ключ использовать нельзя: его `actions` и `ttl` меняются. Внутренние записи интерфейсов vkuxt хранит под непрозрачными ID адаптера, чтобы переживать перерисовки и длинные callback-payload'ы.
+
+Схему состояния можно объявить вторым параметром `Context`:
+
+```python
+from vkuxt import Context, StateNamespace
+
+
+class ScreenState(StateNamespace):
+    uid: int = 0
+    game_id: str = ""
+    seat: int = 0
+
+
+@app.handler
+async def show_game(
+    ctx: Context[VKMessagesCallbackAdapter, ScreenState],
+    metadata: VKMessageMetadata,
+    data: None,
+    text: str,
+) -> None:
+    ctx.state.uid = metadata.user_id
+    ctx.state.extra_value = "сохранится как extra-поле"
+    await ctx.redraw(view)
+```
+
+Второй параметр необязателен: голый `Context` использует базовый `StateNamespace`, где доступны любые атрибуты, но IDE не знает их имён. Поля типизированного namespace должны иметь значения по умолчанию, чтобы состояние можно было создать при первом событии. Если сохранённого JSON нет или он не соответствует модели, `App` создаёт namespace из значений по умолчанию либо сообщает об ошибке загрузки.
 
 Бизнес-состояние можно хранить Pydantic-моделью, а не словарём:
 
@@ -146,7 +172,7 @@ app = App(JSONFileStorage("state.json"), ttl=60 * 60 * 24)
 adapter = app.add_adapter(VKMessagesCallbackAdapter(app, vk, group_id=group_id))
 ```
 
-Хендлеры регистрируются через `app.handler`; фильтрация определяется аннотациями metadata и data, например `(ctx, metadata: VKMessageMetadata, data: StartData, text: str)`. Для любого payload используйте `data: InputData`; для текста без payload — `data: None` или `data: StartData | None`. `VKInterface(text=..., rows=..., attachments=..., ttl=...)` — конкретный интерфейс VK: текст ограничен 4096 символами, inline-клавиатура — 6 рядами по 5 кнопок. Превышение лимитов выбрасывает исключение при создании, а не усекает данные молча. Вложения принимают типы VKX или VK-строки, кнопки — модели `vkx.KeyboardButton`. `VKInterface.callback(..., color=...)` принимает `KeyboardButtonColor` или строку и проверяет допустимые значения.
+Вложения принимают типы VKX или VK-строки, кнопки — модели `vkx.KeyboardButton`. `VKInterface.callback(..., color=...)` принимает `KeyboardButtonColor` или строку и проверяет допустимые значения. `KeyboardButtonColor` реэкспортируется из `vkuxt` и `vkuxt.adapters.vk`, поэтому отдельный импорт из `vkx.models` не нужен.
 
 `await ctx.redraw(view)` выбирает интерфейс текущего события: редактирует сообщение callback-кнопки, отправляет ответ на текст и удаляет старый интерфейс либо отправляет новое сообщение. Для чужого или явно выбранного интерфейса используйте `await adapter.redraw(view, target=handle)`; `peer_id=...` выбирает последний интерфейс диалога. `await ctx.redraw(None)` удаляет текущий интерфейс. `await adapter.send(peer_id, view)` и `await adapter.edit(handle, view)` доступны для явных операций.
 
