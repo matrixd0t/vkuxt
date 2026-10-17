@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
-import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel
+from .codec import KeyLike, encode_key
 
 
 class _DefaultTTL:
@@ -17,33 +16,58 @@ TTLValue = float | None | _DefaultTTL
 
 
 @dataclass(slots=True)
-class Interface:
+class Interface[ButtonT]:
+    """Общий контракт отрисовываемого интерфейса: текст и двумерный список кнопок.
+
+    Базовый класс не знает, чем являются кнопки. Адаптер объявляет свой
+    подкласс через ``Adapter.interface_type`` и при необходимости валидирует
+    транспортные ограничения.
+    """
+
+    text: str = ""
+    rows: Sequence[Sequence[ButtonT]] = ()
     ttl: TTLValue = DEFAULT_TTL
-    tokenize_long_input: bool = True
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Проверить контракт; адаптеры могут вызывать перед отрисовкой."""
+        if not isinstance(self.text, str):
+            raise TypeError("text интерфейса должен быть строкой")
+        normalized_rows: list[tuple[ButtonT, ...]] = []
+        for index, row in enumerate(self.rows):
+            if isinstance(row, (str, bytes, bytearray)):
+                raise TypeError(f"ряд кнопок {index} должен быть последовательностью, а не строкой")
+            normalized_rows.append(tuple(row))
+        self.rows = tuple(normalized_rows)
+        if (
+            not isinstance(self.ttl, _DefaultTTL)
+            and self.ttl is not None
+            and (not isinstance(self.ttl, (int, float)) or self.ttl <= 0)
+        ):
+            raise ValueError("ttl интерфейса должен быть больше нуля или None")
+
+
+@dataclass(slots=True)
+class InterfaceHandle[IdT: KeyLike]:
+    """Python-представление конкретного удалённого интерфейса.
+
+    ``id`` остаётся деталью адаптера и не нужен прикладному коду для
+    перерисовки: объект передаётся в ``Adapter.redraw()`` целиком.
+    """
+
+    id: IdT
     actions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    ttl: float | None = None
 
-    def bind(self, data: BaseModel | dict[str, Any]) -> str | dict[str, Any]:
-        from .app import InputData
+    def state_key(self) -> dict[str, Any]:
+        """Стабильный ключ для ``App.get_state``/``set_state``.
 
-        if isinstance(data, InputData):
-            input_data = data.model_dump(mode="json")
-        elif isinstance(data, dict):
-            input_data = data
-        else:
-            raise TypeError("Структурированные данные должны быть InputData или словарём")
-        encoded = json.dumps(
-            input_data,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        )
-        if not self.tokenize_long_input or len(encoded) <= 255:
-            return input_data
-        token = secrets.token_urlsafe(6)
-        while token in self.actions:
-            token = secrets.token_urlsafe(6)
-        self.actions[token] = {"data": input_data}
-        return token
+        Зависит только от ``id`` и не меняется при перерисовках. Сам handle
+        ключом не является: ``actions`` и ``ttl`` обновляются адаптером.
+        """
+        return {"interface": encode_key(self.id)}
 
 
 @dataclass(slots=True)
@@ -56,7 +80,10 @@ class InterfaceRecord:
 
     @classmethod
     def from_json_data(cls, data: dict[str, Any]) -> InterfaceRecord:
-        return cls(
-            actions=data.get("actions", {}),
-            ttl=data.get("ttl"),
-        )
+        actions = data.get("actions", {})
+        if not isinstance(actions, dict):
+            raise ValueError("Поле actions интерфейса должно быть объектом")
+        ttl = data.get("ttl")
+        if ttl is not None and (not isinstance(ttl, (int, float)) or ttl <= 0):
+            raise ValueError("TTL интерфейса должен быть положительным числом или None")
+        return cls(actions=actions, ttl=ttl)

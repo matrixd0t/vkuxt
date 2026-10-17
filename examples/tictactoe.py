@@ -1,50 +1,65 @@
 from __future__ import annotations
 
 import secrets
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
+from pydantic import BaseModel
 from vkx import VKClient
-from vkx.models import Button, Keyboard, KeyboardButton
+from vkx.models import KeyboardButtonColor as col
 from vkx.server import CallbackServer, create_callback_server
 
 from vkuxt import (
     App,
-    Input,
+    Context,
     InputData,
     InputModel,
     JSONFileStorage,
+    VKInterface,
     VKMessageMetadata,
     VKMessagesCallbackAdapter,
 )
 
+from .tictactoe_rules import board_text, is_valid_code, winner
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
+LOBBY_TTL = 15 * 60
+GAME_TTL = 60 * 60
+CREATE_FAILED_VIEW = VKInterface(
+    text="Не удалось создать игру. Попробуйте ещё раз.",
+    ttl=LOBBY_TTL,
+)
+type VKContext = Context[VKMessagesCallbackAdapter]
+
 
 class TicTacToeInput(InputData):
-    owner_id: int | None = None
+    uid: int | None = None
 
 
 class CreateLobbyInput(TicTacToeInput):
-    handler_name: Literal["ttt.create_lobby"]
+    handler_name: Literal["ttt.create_lobby"] = "ttt.create_lobby"
 
 
 class AskJoinCodeInput(TicTacToeInput):
-    handler_name: Literal["ttt.ask_join_code"]
+    handler_name: Literal["ttt.ask_join_code"] = "ttt.ask_join_code"
 
 
 class CancelJoinInput(TicTacToeInput):
-    handler_name: Literal["ttt.cancel_join"]
+    handler_name: Literal["ttt.cancel_join"] = "ttt.cancel_join"
 
 
 class CloseInput(TicTacToeInput):
-    handler_name: Literal["ttt.close"]
+    handler_name: Literal["ttt.close"] = "ttt.close"
 
 
 class NoopInput(TicTacToeInput):
-    handler_name: Literal["ttt.noop"]
+    handler_name: Literal["ttt.noop"] = "ttt.noop"
 
 
 class MoveInput(TicTacToeInput):
-    handler_name: Literal["ttt.move"]
+    handler_name: Literal["ttt.move"] = "ttt.move"
     game_id: str
     seat: int
     cell: int
@@ -56,15 +71,15 @@ class GameActionInput(TicTacToeInput):
 
 
 class SurrenderInput(GameActionInput):
-    handler_name: Literal["ttt.surrender"]
+    handler_name: Literal["ttt.surrender"] = "ttt.surrender"
 
 
 class BackToMenuInput(GameActionInput):
-    handler_name: Literal["ttt.back_to_menu"]
+    handler_name: Literal["ttt.back_to_menu"] = "ttt.back_to_menu"
 
 
 class LobbyActionInput(TicTacToeInput):
-    handler_name: Literal["ttt.abandon_lobby"]
+    handler_name: Literal["ttt.abandon_lobby"] = "ttt.abandon_lobby"
     code: str
 
 
@@ -73,419 +88,452 @@ class Participant(InputModel):
     peer_id: int
 
 
-class TicTacToeBot:
-    def __init__(self, app: App) -> None:
-        self.adapter = app.get_adapter(VKMessagesCallbackAdapter)
-        self._register_handlers(app)
+class LobbyState(BaseModel):
+    status: Literal["waiting"] = "waiting"
+    owner: Participant
 
-    def _register_handlers(self, app: App) -> None:
-        @app.handler
-        async def menu(app: App, input: Input[None, VKMessageMetadata]) -> None:
-            meta = input.metadata
-            if input.text is not None and input.text.strip().casefold() in {"начать", "меню"}:
-                await self._show_menu(app, meta.peer_id, meta.user_id)
 
-        @app.handler(background=False)
-        async def create_lobby(
-            app: App,
-            input: Input[CreateLobbyInput, VKMessageMetadata],
-        ) -> None:
-            await self._create_lobby(app, input.metadata, input.data)
+class GameState(BaseModel):
+    status: Literal["active", "finished"]
+    game_id: str
+    players: list[Participant]
+    board: list[str | None]
+    turn: int
+    winner: int | None = None
+    finish_reason: Literal["line", "draw", "surrender"] | None = None
 
-        @app.handler(background=False)
-        async def ask_join_code(
-            app: App,
-            input: Input[AskJoinCodeInput, VKMessageMetadata],
-        ) -> None:
-            await self._ask_join_code(app, input.metadata, input.data)
 
-        @app.handler
-        async def join_code(app: App, input: Input[None, VKMessageMetadata]) -> None:
-            if input.text is not None:
-                await self._join_code(app, input.metadata, input.text)
-
-        @app.handler(background=False)
-        async def cancel_join(
-            app: App,
-            input: Input[CancelJoinInput, VKMessageMetadata],
-        ) -> None:
-            if input.data.owner_id == input.metadata.user_id:
-                await self.adapter.transition(None)
-
-        @app.handler(background=False)
-        async def abandon_lobby(
-            app: App,
-            input: Input[LobbyActionInput, VKMessageMetadata],
-        ) -> None:
-            await self._abandon_lobby(app, input.metadata, input.data)
-
-        @app.handler(background=False)
-        async def move(app: App, input: Input[MoveInput, VKMessageMetadata]) -> None:
-            await self._move(app, input.metadata, input.data)
-
-        @app.handler(background=False)
-        async def surrender(
-            app: App,
-            input: Input[SurrenderInput, VKMessageMetadata],
-        ) -> None:
-            await self._surrender(app, input.metadata, input.data)
-
-        @app.handler(background=False)
-        async def back_to_menu(
-            app: App,
-            input: Input[BackToMenuInput, VKMessageMetadata],
-        ) -> None:
-            await self._back_to_menu(app, input.metadata, input.data)
-
-        @app.handler(background=False)
-        async def close(app: App, input: Input[CloseInput, VKMessageMetadata]) -> None:
-            if input.data.owner_id == input.metadata.user_id:
-                await self.adapter.transition(None)
-
-        @app.handler(background=False)
-        async def noop(app: App, input: Input[InputData | None, VKMessageMetadata]) -> None:
-            return None
-
-    async def _show_menu(self, app: App, peer_id: int, user_id: int) -> None:
-        draft = self.adapter.new_interface(text="Крестики-нолики. Выберите действие:")
-        create_payload = draft.bind(
-            CreateLobbyInput(handler_name="ttt.create_lobby", owner_id=user_id)
-        )
-        join_payload = draft.bind(
-            AskJoinCodeInput(handler_name="ttt.ask_join_code", owner_id=user_id)
-        )
-        close_payload = draft.bind(CloseInput(handler_name="ttt.close", owner_id=user_id))
-        keyboard = Keyboard.from_rows(
+def menu_view(uid: int) -> VKInterface:
+    return VKInterface(
+        text="Крестики-нолики. Выберите действие:",
+        ttl=LOBBY_TTL,
+        rows=[
             [
-                [
-                    Button.callback("Создать игру", payload=create_payload),
-                    Button.callback("Подключиться к игре", payload=join_payload),
-                    Button.callback("Закрыть", payload=close_payload),
-                ]
+                VKInterface.callback(
+                    "Создать игру",
+                    CreateLobbyInput(uid=uid),
+                    color=col.POSITIVE,
+                ),
+                VKInterface.callback(
+                    "Подключиться к игре",
+                    AskJoinCodeInput(uid=uid),
+                    color=col.PRIMARY,
+                ),
+                VKInterface.callback(
+                    "Закрыть",
+                    CloseInput(uid=uid),
+                    color=col.NEGATIVE,
+                ),
+            ]
+        ],
+    )
+
+
+def lobby_view(code: str) -> VKInterface:
+    return VKInterface(
+        text=f"Ожидаем второго игрока. Код игры: {code}",
+        ttl=LOBBY_TTL,
+        rows=[
+            [
+                VKInterface.callback(
+                    "Покинуть подбор",
+                    LobbyActionInput(code=code),
+                    color=col.NEGATIVE,
+                )
+            ]
+        ],
+    )
+
+
+def join_prompt_view(uid: int) -> VKInterface:
+    return VKInterface(
+        text="Введите код игры ответом на это сообщение:",
+        ttl=LOBBY_TTL,
+        rows=[
+            [
+                VKInterface.callback(
+                    "Закрыть",
+                    CancelJoinInput(uid=uid),
+                    color=col.NEGATIVE,
+                )
+            ]
+        ],
+    )
+
+
+def game_view(game: GameState, seat: int) -> VKInterface:
+    player = game.players[seat]
+    rendered_board = board_text(game.board)
+    if game.status == "active":
+        rows = []
+        for row in range(3):
+            buttons = []
+            for column in range(3):
+                cell = row * 3 + column
+                value = game.board[cell]
+                if seat == game.turn and value is None:
+                    buttons.append(
+                        VKInterface.callback(
+                            str(cell + 1),
+                            MoveInput(
+                                game_id=game.game_id,
+                                seat=seat,
+                                cell=cell,
+                            ),
+                            color=col.PRIMARY,
+                        )
+                    )
+                else:
+                    buttons.append(
+                        VKInterface.callback(value or str(cell + 1), NoopInput())
+                    )
+            rows.append(buttons)
+        rows.append(
+            [
+                VKInterface.callback(
+                    "Покинуть игру",
+                    SurrenderInput(game_id=game.game_id, seat=seat),
+                    color=col.NEGATIVE,
+                )
             ]
         )
-        draft.kb = keyboard
-        await self.adapter.transition(draft, peer_id=peer_id)
-
-    async def _create_lobby(
-        self,
-        app: App,
-        metadata: VKMessageMetadata,
-        event: CreateLobbyInput,
-    ) -> None:
-        if event.owner_id != metadata.user_id:
-            return
-        for _ in range(8):
-            code = secrets.token_hex(3).upper()
-            key = {
-                "app": "ttt",
-                "kind": "lobby",
-                "group_id": metadata.group_id,
-                "code": code,
-            }
-            async with app.lock(key):
-                if await app.get_state(key) is not None:
-                    continue
-                owner = Participant(
-                    user_id=metadata.user_id,
-                    peer_id=metadata.peer_id,
-                )
-                await app.set_state(
-                    key,
-                    {"status": "waiting", "owner": owner.model_dump(mode="json")},
-                )
-                await self._render_lobby(app, code)
-                return
-        raise RuntimeError("Не удалось подобрать свободный код игры")  # noqa: RUF001
-
-    async def _render_lobby(
-        self,
-        app: App,
-        code: str,
-    ) -> None:
-        draft = self.adapter.new_interface(text=f"Ожидаем второго игрока. Код игры: {code}")
-        payload = draft.bind(LobbyActionInput(handler_name="ttt.abandon_lobby", code=code))
-        keyboard = Keyboard.from_rows([[Button.callback("Покинуть подбор", payload=payload)]])
-        draft.kb = keyboard
-        await self.adapter.transition(draft)
-
-    async def _ask_join_code(
-        self,
-        app: App,
-        metadata: VKMessageMetadata,
-        event: AskJoinCodeInput,
-    ) -> None:
-        if event.owner_id == metadata.user_id:
-            await self._render_join_prompt(app, metadata.user_id)
-
-    async def _render_join_prompt(
-        self,
-        app: App,
-        owner_id: int,
-    ) -> None:
-        draft = self.adapter.new_interface(text="Введите код игры ответом на это сообщение:")
-        close_payload = draft.bind(
-            CancelJoinInput(handler_name="ttt.cancel_join", owner_id=owner_id)
+        status = "Ваш ход" if game.turn == seat else "Ход соперника"
+        text = (
+            f"{rendered_board}\n\n"
+            f"{status}. Вы играете за {'X' if seat == 0 else 'O'}."
         )
-        keyboard = Keyboard.from_rows([[Button.callback("Закрыть", payload=close_payload)]])
-        draft.kb = keyboard
-        await self.adapter.transition(draft)
+    else:
+        winner_seat = game.winner
+        if winner_seat is None:
+            result = "Ничья."
+        elif winner_seat == seat:
+            result = "Вы победили."
+        else:
+            result = "Вы проиграли."
+        if game.finish_reason == "surrender" and winner_seat == seat:
+            result = "Соперник сдался. Вы победили."
+        rows = [
+            [
+                VKInterface.callback(
+                    "В меню",
+                    BackToMenuInput(game_id=game.game_id, seat=seat),
+                    color=col.PRIMARY,
+                ),
+                VKInterface.callback(
+                    "Закрыть",
+                    CloseInput(uid=player.user_id),
+                    color=col.NEGATIVE,
+                ),
+            ]
+        ]
+        text = f"{rendered_board}\n\nИгра завершена. {result}"
+    return VKInterface(text=text, rows=rows, ttl=GAME_TTL)
 
-    async def _join_code(
-        self,
-        app: App,
-        metadata: VKMessageMetadata,
-        text: str,
-    ) -> None:
-        code = text.strip().upper()
-        if len(code) != 6 or any(character not in "0123456789ABCDEF" for character in code):
-            return
-        lobby_key = {
+
+async def menu(
+    ctx: Context,
+    metadata: VKMessageMetadata,
+    data: None,
+    text: str,
+) -> None:
+    if text.strip().casefold() not in {"начать", "меню"}:
+        return
+    ctx.state["uid"] = metadata.user_id
+    await ctx.redraw(menu_view(metadata.user_id))
+
+
+async def create_lobby(
+    ctx: Context,
+    metadata: VKMessageMetadata,
+    data: CreateLobbyInput,
+    text: str,
+) -> None:
+    if data.uid != metadata.user_id:
+        return
+    for _ in range(8):
+        code = secrets.token_hex(3).upper()
+        key = {
             "app": "ttt",
             "kind": "lobby",
             "group_id": metadata.group_id,
             "code": code,
         }
-        game_id = uuid4().hex
-        game_key = {
-            "app": "ttt",
-            "kind": "game",
-            "group_id": metadata.group_id,
-            "game_id": game_id,
-        }
-        async with app.lock(lobby_key, game_key):
-            lobby = await app.get_state(lobby_key)
-            if lobby is None or lobby.get("status") != "waiting":
-                return
-
-            joiner = Participant(
+        async with ctx.app.lock(key):
+            if await ctx.app.get_state(key, LobbyState) is not None:
+                continue
+            owner = Participant(
                 user_id=metadata.user_id,
                 peer_id=metadata.peer_id,
             )
-            players = [lobby["owner"], joiner.model_dump(mode="json")]
-            game = {
-                "status": "active",
-                "game_id": game_id,
-                "players": players,
-                "board": [None] * 9,
-                "turn": secrets.randbelow(2),
-                "winner": None,
-            }
-            await app.delete_state(lobby_key)
-            await app.set_state(game_key, game)
-            await self._render_game(app, metadata.group_id, game)
+            await ctx.app.set_state(
+                key,
+                LobbyState(owner=owner),
+                ttl=LOBBY_TTL,
+            )
+        ctx.state["uid"] = metadata.user_id
+        ctx.state["code"] = code
+        await ctx.redraw(lobby_view(code))
+        return
+    await ctx.redraw(CREATE_FAILED_VIEW)
 
-    async def _abandon_lobby(
-        self,
-        app: App,
-        metadata: VKMessageMetadata,
-        event: LobbyActionInput,
-    ) -> None:
-        key = {
-            "app": "ttt",
-            "kind": "lobby",
-            "group_id": metadata.group_id,
-            "code": event.code,
-        }
-        async with app.lock(key):
-            lobby = await app.get_state(key)
-            if lobby is None or lobby.get("status") != "waiting":
-                return
-            owner = lobby["owner"]
-            if not _is_owner(owner, metadata):
-                return
-            await app.delete_state(key)
-            await self.adapter.transition(None)
 
-    async def _move(
-        self,
-        app: App,
-        metadata: VKMessageMetadata,
-        event: MoveInput,
-    ) -> None:
-        key = {
-            "app": "ttt",
-            "kind": "game",
-            "group_id": metadata.group_id,
-            "game_id": event.game_id,
-        }
-        async with app.lock(key):
-            game = await app.get_state(key)
-            if game is None or not self._authorized_turn(game, metadata, event):
-                return
-            if not 0 <= event.cell < 9 or game["board"][event.cell] is not None:
-                return
-            game["board"][event.cell] = "X" if event.seat == 0 else "O"
-            winner = _winner(game["board"])
-            if winner is not None:
-                game["status"] = "finished"
-                game["winner"] = winner
-                game["finish_reason"] = "line"
-            elif all(game["board"]):
-                game["status"] = "finished"
-                game["winner"] = None
-                game["finish_reason"] = "draw"
-            else:
-                game["turn"] = 1 - event.seat
-            await app.set_state(key, game)
-            await self._render_game(app, metadata.group_id, game)
+async def ask_join_code(
+    ctx: Context,
+    metadata: VKMessageMetadata,
+    data: AskJoinCodeInput,
+    text: str,
+) -> None:
+    if data.uid != metadata.user_id:
+        return
+    ctx.state["uid"] = metadata.user_id
+    await ctx.redraw(join_prompt_view(metadata.user_id))
 
-    async def _surrender(
-        self,
-        app: App,
-        metadata: VKMessageMetadata,
-        event: SurrenderInput,
-    ) -> None:
-        key = {
-            "app": "ttt",
-            "kind": "game",
-            "group_id": metadata.group_id,
-            "game_id": event.game_id,
-        }
-        async with app.lock(key):
-            game = await app.get_state(key)
-            if (
-                game is None
-                or not self._authorized_player(game, metadata, event)
-                or game["status"] != "active"
-            ):
-                return
-            game["status"] = "finished"
-            game["winner"] = 1 - event.seat
-            game["finish_reason"] = "surrender"
-            await app.set_state(key, game)
-            await self._render_game(app, metadata.group_id, game)
 
-    async def _back_to_menu(
-        self,
-        app: App,
-        metadata: VKMessageMetadata,
-        event: BackToMenuInput,
-    ) -> None:
-        key = {
-            "app": "ttt",
-            "kind": "game",
-            "group_id": metadata.group_id,
-            "game_id": event.game_id,
+async def join_code(
+    ctx: VKContext,
+    metadata: VKMessageMetadata,
+    data: None,
+    text: str,
+) -> None:
+    if metadata.event_type != "message_new":
+        return
+    code = text.strip().upper()
+    if not is_valid_code(code):
+        return
+
+    lobby_key = {
+        "app": "ttt",
+        "kind": "lobby",
+        "group_id": metadata.group_id,
+        "code": code,
+    }
+    game_id = uuid4().hex
+    game_key = {
+        "app": "ttt",
+        "kind": "game",
+        "group_id": metadata.group_id,
+        "game_id": game_id,
+    }
+    async with ctx.app.lock(lobby_key, game_key):
+        lobby = await ctx.app.get_state(lobby_key, LobbyState)
+        if lobby is None or lobby.status != "waiting":
+            return
+        if lobby.owner.user_id == metadata.user_id:
+            return
+        joiner = Participant(
+            user_id=metadata.user_id,
+            peer_id=metadata.peer_id,
+        )
+        game = GameState(
+            status="active",
+            game_id=game_id,
+            players=[lobby.owner, joiner],
+            board=[None] * 9,
+            turn=secrets.randbelow(2),
+        )
+        await ctx.app.delete_state(lobby_key)
+        await ctx.app.set_state(game_key, game, ttl=GAME_TTL)
+
+    for seat, player in enumerate(game.players):
+        screen_state = {
+            "game_id": game.game_id,
+            "seat": seat,
+            "uid": player.user_id,
         }
-        game = await app.get_state(key)
+        view = game_view(game, seat)
+        if player.peer_id == metadata.peer_id:
+            ctx.state.update(screen_state)
+            await ctx.redraw(view)
+        else:
+            handle = await ctx.adapter.redraw(view, peer_id=player.peer_id)
+            if handle is not None:
+                await ctx.app.set_state(handle.state_key(), screen_state, ttl=GAME_TTL)
+
+
+async def cancel_join(
+    ctx: Context,
+    metadata: VKMessageMetadata,
+    data: CancelJoinInput,
+    text: str,
+) -> None:
+    if data.uid != metadata.user_id:
+        return
+    if ctx.state.get("uid") != metadata.user_id:
+        return
+    await ctx.redraw(None)
+
+
+async def abandon_lobby(
+    ctx: Context,
+    metadata: VKMessageMetadata,
+    data: LobbyActionInput,
+    text: str,
+) -> None:
+    code = ctx.state.get("code")
+    if not isinstance(code, str) or code != data.code:
+        return
+    key = {
+        "app": "ttt",
+        "kind": "lobby",
+        "group_id": metadata.group_id,
+        "code": code,
+    }
+    async with ctx.app.lock(key):
+        lobby = await ctx.app.get_state(key, LobbyState)
+        if lobby is None or lobby.status != "waiting":
+            return
+        owner = lobby.owner
         if (
-            game is None
-            or game["status"] != "finished"
-            or not self._participant_seat(game, metadata, event)
+            owner.user_id != metadata.user_id
+            or owner.peer_id != metadata.peer_id
         ):
             return
-        await self._show_menu(app, metadata.peer_id, metadata.user_id)
+        await ctx.app.delete_state(key)
+    await ctx.redraw(None)
 
-    def _authorized_turn(
-        self,
-        game: dict[str, Any] | None,
-        metadata: VKMessageMetadata,
-        event: MoveInput,
-    ) -> bool:
-        return (
-            game is not None
-            and game["status"] == "active"
-            and game["turn"] == event.seat
-            and self._participant_seat(game, metadata, event)
-        )
 
-    def _authorized_player(
-        self,
-        game: dict[str, Any] | None,
-        metadata: VKMessageMetadata,
-        event: GameActionInput,
-    ) -> bool:
-        return (
-            game is not None
-            and 0 <= event.seat < 2
-            and self._participant_seat(game, metadata, event)
-        )
+async def game_action(
+    ctx: VKContext,
+    metadata: VKMessageMetadata,
+    data: MoveInput | SurrenderInput,
+    text: str,
+) -> None:
+    game_id = ctx.state.get("game_id")
+    seat = ctx.state.get("seat")
+    if game_id != data.game_id or seat != data.seat:
+        return
+    key = {
+        "app": "ttt",
+        "kind": "game",
+        "group_id": metadata.group_id,
+        "game_id": data.game_id,
+    }
+    async with ctx.app.lock(key):
+        game = await ctx.app.get_state(key, GameState)
+        if game is None or game.status != "active":
+            return
+        if not 0 <= data.seat < len(game.players):
+            return
+        player = game.players[data.seat]
+        if (
+            player.user_id != metadata.user_id
+            or player.peer_id != metadata.peer_id
+        ):
+            return
 
-    @staticmethod
-    def _participant_seat(
-        game: dict[str, Any],
-        metadata: VKMessageMetadata,
-        event: GameActionInput | MoveInput,
-    ) -> bool:
-        seat = getattr(event, "seat", None)
-        if not isinstance(seat, int) or not 0 <= seat < 2:
-            return False
-        player = game["players"][seat]
-        return player["user_id"] == metadata.user_id and player["peer_id"] == metadata.peer_id
-
-    async def _render_game(self, app: App, group_id: int, game: dict[str, Any]) -> None:
-        board_text = _board_text(game["board"])
-        for seat, player in enumerate(game["players"]):
-            draft = self.adapter.new_interface()
-            if game["status"] == "active":
-                rows: list[list[KeyboardButton]] = []
-                for row in range(3):
-                    buttons = []
-                    for column in range(3):
-                        cell = row * 3 + column
-                        value = game["board"][cell]
-                        handler = (
-                            "ttt.move" if seat == game["turn"] and value is None else "ttt.noop"
-                        )
-                        if handler == "ttt.move":
-                            payload = draft.bind(
-                                MoveInput(
-                                    handler_name="ttt.move",
-                                    game_id=game["game_id"],
-                                    seat=seat,
-                                    cell=cell,
-                                )
-                            )
-                        else:
-                            payload = draft.bind(NoopInput(handler_name="ttt.noop"))
-                        label = value or str(cell + 1)
-                        buttons.append(Button.callback(label, payload=payload))
-                    rows.append(buttons)
-                surrender = draft.bind(
-                    SurrenderInput(
-                        handler_name="ttt.surrender",
-                        game_id=game["game_id"],
-                        seat=seat,
-                    )
-                )
-                rows.append([Button.callback("Покинуть игру", payload=surrender)])
-                status = "Ваш ход" if game["turn"] == seat else "Ход соперника"
-                text = f"{board_text}\n\n{status}. Вы играете за {'X' if seat == 0 else 'O'}."
+        if isinstance(data, MoveInput):
+            if game.turn != data.seat:
+                return
+            if not 0 <= data.cell < 9 or game.board[data.cell] is not None:
+                return
+            game.board[data.cell] = "X" if data.seat == 0 else "O"
+            won_seat = winner(game.board)
+            if won_seat is not None:
+                game.status = "finished"
+                game.winner = won_seat
+                game.finish_reason = "line"
+            elif all(game.board):
+                game.status = "finished"
+                game.winner = None
+                game.finish_reason = "draw"
             else:
-                winner = game["winner"]
-                if winner is None:
-                    result = "Ничья."
-                elif winner == seat:
-                    result = "Вы победили."
-                else:
-                    result = "Вы проиграли."
-                if game.get("finish_reason") == "surrender" and winner == seat:
-                    result = "Соперник сдался. Вы победили."
-                menu_payload = draft.bind(
-                    BackToMenuInput(
-                        handler_name="ttt.back_to_menu",
-                        game_id=game["game_id"],
-                        seat=seat,
-                    )
+                game.turn = 1 - data.seat
+        else:
+            game.status = "finished"
+            game.winner = 1 - data.seat
+            game.finish_reason = "surrender"
+        await ctx.app.set_state(key, game, ttl=GAME_TTL)
+
+        # Рендер под тем же lock'ом сохраняет порядок досок.
+        for render_seat, render_player in enumerate(game.players):
+            screen_state = {
+                "game_id": game.game_id,
+                "seat": render_seat,
+                "uid": render_player.user_id,
+            }
+            view = game_view(game, render_seat)
+            if render_player.peer_id == metadata.peer_id:
+                ctx.state.update(screen_state)
+                await ctx.redraw(view)
+            else:
+                handle = await ctx.adapter.redraw(
+                    view,
+                    peer_id=render_player.peer_id,
                 )
-                close_payload = draft.bind(
-                    CloseInput(
-                        handler_name="ttt.close",
-                        owner_id=player["user_id"],
+                if handle is not None:
+                    await ctx.app.set_state(
+                        handle.state_key(),
+                        screen_state,
+                        ttl=GAME_TTL,
                     )
-                )
-                rows = [
-                    [
-                        Button.callback("В меню", payload=menu_payload),  # noqa: RUF001
-                        Button.callback("Закрыть", payload=close_payload),
-                    ]
-                ]
-                text = f"{board_text}\n\nИгра завершена. {result}"  # noqa: RUF001
-            keyboard = Keyboard.from_rows(rows)
-            draft.text = text
-            draft.kb = keyboard
-            await self.adapter.transition(draft, peer_id=player["peer_id"])
+
+
+async def back_to_menu(
+    ctx: Context,
+    metadata: VKMessageMetadata,
+    data: BackToMenuInput,
+    text: str,
+) -> None:
+    if ctx.state.get("game_id") != data.game_id or ctx.state.get("seat") != data.seat:
+        return
+    key = {
+        "app": "ttt",
+        "kind": "game",
+        "group_id": metadata.group_id,
+        "game_id": data.game_id,
+    }
+    game = await ctx.app.get_state(key, GameState)
+    if game is None or game.status != "finished":
+        return
+    if not 0 <= data.seat < len(game.players):
+        return
+    player = game.players[data.seat]
+    if (
+        player.user_id != metadata.user_id
+        or player.peer_id != metadata.peer_id
+    ):
+        return
+    ctx.state.clear()
+    ctx.state["uid"] = metadata.user_id
+    await ctx.redraw(menu_view(metadata.user_id))
+
+
+async def close(
+    ctx: Context,
+    metadata: VKMessageMetadata,
+    data: CloseInput,
+    text: str,
+) -> None:
+    if data.uid != metadata.user_id:
+        return
+    if ctx.state.get("uid") != metadata.user_id:
+        return
+    await ctx.redraw(None)
+
+
+async def noop(
+    ctx: Context,
+    metadata: VKMessageMetadata,
+    data: NoopInput,
+    text: str,
+) -> None:
+    return None
+
+
+def register_handlers(app: App) -> None:
+    for handler in (
+        menu,
+        create_lobby,
+        ask_join_code,
+        join_code,
+        cancel_join,
+        abandon_lobby,
+        game_action,
+        back_to_menu,
+        close,
+        noop,
+    ):
+        app.add_handler(handler)
 
 
 async def make_callback_app(
@@ -495,7 +543,7 @@ async def make_callback_app(
     *,
     storage_path: str = "tictactoe-state.json",
     secret: str | None = None,
-):
+) -> App:
     """Создаёт приложение; HTTP-сервер передаёт POST body в App.handle_input."""
     app = App(storage=JSONFileStorage(storage_path))
     callback_server: CallbackServer = await create_callback_server(
@@ -506,17 +554,19 @@ async def make_callback_app(
         secret=secret,
     )
     app.add_adapter(
-        VKMessagesCallbackAdapter,
-        vk,
-        group_id,
-        callback_server=callback_server,
-        dm_latest_interface=False,
+        VKMessagesCallbackAdapter(
+            app,
+            vk,
+            group_id,
+            callback_server=callback_server,
+            dm_latest_interface=False,
+        ),
     )
-    TicTacToeBot(app)
+    register_handlers(app)
     return app
 
 
-def attach_fastapi(app: App):
+def attach_fastapi(app: App) -> FastAPI:
     from fastapi import FastAPI, Request
     from fastapi.responses import PlainTextResponse
 
@@ -528,32 +578,3 @@ def attach_fastapi(app: App):
         return PlainTextResponse("ok" if response is None else str(response))
 
     return web
-
-
-def _is_owner(
-    owner: dict[str, Any],
-    metadata: VKMessageMetadata,
-) -> bool:
-    return owner["user_id"] == metadata.user_id and owner["peer_id"] == metadata.peer_id
-
-
-def _winner(board: list[str | None]) -> int | None:
-    lines = (
-        (0, 1, 2),
-        (3, 4, 5),
-        (6, 7, 8),
-        (0, 3, 6),
-        (1, 4, 7),
-        (2, 5, 8),
-        (0, 4, 8),
-        (2, 4, 6),
-    )
-    for a, b, c in lines:
-        if board[a] is not None and board[a] == board[b] == board[c]:
-            return 0 if board[a] == "X" else 1
-    return None
-
-
-def _board_text(board: list[str | None]) -> str:
-    cells = [value or "·" for value in board]
-    return "\n".join(" | ".join(cells[row : row + 3]) for row in range(0, 9, 3))

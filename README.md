@@ -2,80 +2,133 @@
 
 `vkuxt` — асинхронный каркас для приложений, в которых пользовательские действия приходят через адаптеры, например VK-бота. Он не навязывает FSM, схему бизнес-состояния, шаблонизатор, рендеринг или правила перерисовки. Транспорт и типизированные VK API-вызовы предоставляет `vkx`.
 
+## Установка
+
+Нужен Python 3.13+.
+
+```powershell
+uv sync --extra dev          # разработка в репозитории
+uv add vkuxt                 # в приложении, когда пакет опубликован
+```
+
+`vkx` входит в основные зависимости; отдельный extra для VK не требуется.
+
 ## Модель
 
-- `App` передаёт сырой ввод адаптерам по очереди. Первый распознавший формат адаптер возвращает `Input` с полями `metadata`, `data` и `text`; текст и typed payload могут присутствовать одновременно.
-- `metadata` содержит адаптер-специфичный экземпляр `BaseMetadata`, `data` — базовый `InputData` или `None`, `text` — строку или `None`. При регистрации `App` индексирует хендлеры по типам metadata из `Input[DataType, MetadataType]`; объединения задаются через `|`. Для подходящего типа metadata адаптерский `data` проверяется по очереди против моделей, объявленных хендлером; при первом успешном варианте хендлер получает уже валидированную модель. `Input[None, MetadataType]` предназначен для событий без typed data; голый `Input` или `Input[Any, BaseMetadata]` подходит для наблюдателей без фильтра.
-- Хендлер получает `(app, input)`. Сначала последовательно вызываются подходящие `background=False` хендлеры в порядке регистрации; первый непустой результат возвращается адаптеру. Если они ничего не вернули, подходящие `background=True` хендлеры последовательно запускаются одной `asyncio.Task`. `raise StopHandlerChain` прекращает текущую фазу опроса.
-- `InputData` проверяет строгую JSON-сериализуемость при Pydantic-валидации и присваивании. `handler_name` — обычное поле данных; `Literal[...]` можно использовать для разделения моделей, но диспетчер не интерпретирует это поле.
-- Ключи приложения — обычные словари или модели. `encode_key` канонически сериализует их; модели сохраняют в сериализации полное имя типа, данные сортируются по ключам. Такой же codec используется всеми storage-бэкендами и адаптерами.
-- Сохранённый интерфейс адресуется внешним идентификатором. Для сообщения VK это `VKMessageInterfaceId(cmid, peer_id, group_id)`, но VK-хендлеры не получают его: адаптер хранит текущий контекст события и сам находит интерфейс через `App.get_interface()`.
-- `Interface.bind()` обычно возвращает словарь typed input напрямую. Только payload длиннее лимита VK заменяется коротким token, данные которого хранятся в записи интерфейса; опция отключается через `App(tokenize_long_input=False)`.
-- Повторный `register_interface()` заменяет таблицу больших token-payload. Рендеринг остаётся ответственностью приложения или адаптера.
-- Handler может явно блокировать одно или несколько состояний через `async with app.lock(key, ...)`. Lock удерживается во время тела блока; читайте состояние после получения lock. Ключи блокируются в каноническом порядке, вложенное получение того же lock допустимо. Блокировки процессные и рассчитаны на один event loop/процесс.
-- Изменение состояния само по себе не инициирует перерисовку. Handler задаёт следующее состояние шаблоном интерфейса адаптера; адаптер решает, отправить, отредактировать или заменить сообщение.
+- `App` передаёт сырой ввод адаптерам по очереди. Первый распознавший формат адаптер возвращает внутренний `Input` с полями `metadata`, `data`, `text` и `interface`; текст и typed payload могут присутствовать одновременно. Прикладной хендлер получает уже не `Input`.
+- Контракт хендлера: `(ctx, metadata, data, text)`. `ctx` — `Context`, привязанный к текущему интерфейсу; `metadata` — экземпляр `BaseMetadata`, `data` — валидированная модель `InputData` или `None`, `text` — строка (пустая, если текста нет). В аннотациях metadata и data указывается одна модель или `Union` моделей через `|`. Диспетчер пропускает хендлер, если metadata не подходит по типу или payload не валидируется ни в одну из указанных data-моделей. `data: None` означает событие без payload; `data: Model | None` принимает оба варианта. `BaseMetadata` и `InputData` в аннотации работают как широкие фильтры.
+- `ctx.state` — изменяемый JSON-объект, привязанный к текущему интерфейсу. После успешного завершения хендлера он сохраняется автоматически. `ctx.redraw(view)` перерисовывает текущий интерфейс и переносит состояние на новый handle; `ctx.redraw(None)` удаляет интерфейс и его состояние. Через `ctx` доступны `ctx.app`, `ctx.adapter`, `ctx.interface` и `ctx.metadata`. Параметризуйте `Context` типом адаптера только там, где нужен его специфичный API (`Context[VKMessagesCallbackAdapter]`); для `ctx.redraw`, `ctx.state` и `ctx.app` достаточно обычного `Context`.
+- По умолчанию хендлеры fire-and-forget: `App.dispatch_event` только запускает их в одной `asyncio.Task` и сразу возвращает управление. `await app.wait_background()` ждёт завершения; `App.close()` также дренирует задачи. `@app.handler(background=False)` оставляет явный foreground-режим: такие хендлеры вызываются последовательно, а первый непустой результат возвращается адаптеру. `raise StopHandlerChain` прекращает текущую фазу опроса.
+- `InputData` проверяет строгую JSON-сериализуемость при Pydantic-валидации и присваивании. `handler_name` — обычное поле данных; диспетчер не интерпретирует его. Чтобы не передавать `handler_name` вручную, задайте значение по умолчанию прямо в модели: `handler_name: Literal["ttt.close"] = "ttt.close"`.
+- Ключи приложения — обычные словари, dataclass'ы или Pydantic-модели. `encode_key` канонически сериализует их; данные сортируются по ключам, а тип по умолчанию кодируется полным именем класса. Для стабильного тега можно объявить `__vkuxt_key_type__: ClassVar[str]`, чтобы перенос модуля не ломал сохранённые ключи. Storage-ключи версионированы (`vkuxt:v1:...`); ключи предыдущих alpha-версий без `v1` не читаются.
+- Аннотации хендлера разрешаются при регистрации. Неразрешимое имя, неверное число аргументов, `ctx` не `Context`, metadata не из `BaseMetadata`, data не из `InputData`/`None` или `text` не `str` приводят к `TypeError`, а не к тихому превращению хендлера в wildcard. Ошибки фоновых хендлеров и запуска адаптеров пишутся в `logging.getLogger("vkuxt")`.
+- `Interface` — общий контракт отрисовываемого экрана: `text` и двумерный список кнопок. Адаптер объявляет свой подкласс через `Adapter.interface_type`; для VK это `VKInterface`, который проверяет лимиты сообщения и inline-клавиатуры.
+- Конкретный удалённый интерфейс представлен `InterfaceHandle` — Python-объектом с непрозрачным `id`, который не меняется при перерисовках. Прикладной код передаёт handle в `Adapter.redraw()` и не работает с `cmid`/peer-id напрямую. Входящий интерфейс доступен хендлеру как `ctx.interface`; `ctx.redraw(view)` рисует именно его.
+- Callback-payload'ы кладутся в кнопки обычными `InputData` или словарями. Адаптер сам сериализует их и заменяет payload длиннее 255 байт UTF-8 коротким token; token'ы хранятся в записи интерфейса. `App(tokenize_long_input=False)` отключает замену.
+- Рендеринг остаётся ответственностью приложения: оно собирает `Interface` и вызывает `ctx.redraw(view)`, а адаптер решает, отправить сообщение, отредактировать существующее или удалить его.
+- Handler может явно блокировать одно или несколько состояний через `async with app.lock(key, ...)`. Lock удерживается во время тела блока; читайте состояние после получения lock. Ключи блокируются в каноническом порядке, повторное получение уже удерживаемого набора допустимо. Новые ключи при вложенном захвате должны сортироваться позже всех уже удерживаемых; иначе выбрасывается `RuntimeError`, потому что такой захват может привести к взаимоблокировке. Блокировки процессные и рассчитаны на один event loop/процесс.
+- Изменение состояния само по себе не инициирует перерисовку. Handler собирает `Interface` и вызывает `ctx.redraw()`.
 
 ## Минимальный пример
 
 ```python
 from typing import Literal
 
-from vkuxt import App, BaseMetadata, Input, InputData, MemoryStorage
+from vkuxt import (
+    App,
+    Context,
+    InputData,
+    MemoryStorage,
+    VKInterface,
+    VKMessageMetadata,
+)
 
 app = App(storage=MemoryStorage())
 
 
-class GreetingMetadata(BaseMetadata):
-    user_id: int
-
-
 class Greeting(InputData):
-    handler_name: Literal["greeting-data"]
+    handler_name: Literal["greeting-data"] = "greeting-data"
     text: str
 
 
-@app.handler(background=False)
+@app.handler
 async def greeting(
-    app: App,
-    input: Input[Greeting | None, GreetingMetadata],
+    ctx: Context,
+    metadata: VKMessageMetadata,
+    data: Greeting | None,
+    text: str,
 ) -> None:
-    data = input.data
     if data is not None:
-        text = data.text
-    elif input.text is not None:
-        if input.text.casefold() != "привет":
-            return
-        text = input.text
+        message = data.text
+    elif text.casefold() == "привет":
+        message = text
     else:
         return
-    key = {"kind": "greeting-count", "user_id": input.metadata.user_id}
-    async with app.lock(key):
-        count = await app.get_state(key) or 0
-        await app.set_state(key, count + 1)
+    ctx.state["last"] = message
+    await ctx.redraw(
+        VKInterface(
+            text=f"{message}, {metadata.user_id}",
+            rows=[[VKInterface.callback("Ещё", Greeting(text="кнопка"))]],
+        )
+    )
 ```
 
-Адаптер строит `GreetingMetadata` из транспортных полей. До вызова хендлера `App` проверяет payload в `Greeting`; если он невалиден, хендлер пропускается. `None` в типе data позволяет тому же хендлеру получать текстовые события без payload. Можно объявить несколько моделей и типов metadata, например `Input[StartData | StopData, VKMessageMetadata | OtherMetadata]`. `handler_name` остаётся обычным полем данных и не интерпретируется диспетчером.
+До вызова хендлера `App` проверяет payload в `Greeting`; если он невалиден, хендлер пропускается. `None` в типе data позволяет тому же хендлеру получать текстовые события без payload. Можно объявить несколько моделей и типов metadata, например `data: StartData | StopData`, `metadata: VKMessageMetadata | OtherMetadata`. `handler_name` остаётся обычным полем данных и не интерпретируется диспетчером; значение по умолчанию избавляет от повторения в каждом конструкторе.
 
-Для кнопки приложение создаёт `Interface` и кладёт payload в кнопку. Когда площадка отправила/обновила сообщение и получила внешний ID, `Interface` сохраняется под этим ID:
+`ctx.state` автоматически сохраняется после хендлера. `ctx.redraw(view)` перерисовывает текущий интерфейс; вручную регистрировать внешний ID не нужно. `VKInterface.callback` принимает `InputData` или словарь и сериализует payload:
 
 ```python
-draft = app.new_interface()
-payload = draft.bind(Greeting(handler_name="greeting-data", text="кнопка"))
-# VK получает payload с обычными полями модели, включая handler_name.
-await app.register_interface(vk_message_mount_id, draft)
+view = VKInterface(
+    text="Выберите действие:",
+    rows=[[
+        VKInterface.callback(
+            "Привет",
+            Greeting(text="кнопка"),
+        )
+    ]],
+)
+await ctx.redraw(view)                        # текущий интерфейс события
+await adapter.redraw(view, peer_id=123)       # последний интерфейс диалога
+await adapter.redraw(view, target=handle)     # конкретный интерфейс
+await ctx.redraw(None)                        # удалить текущий
 ```
 
-`App.handle_input(raw)` передаёт запрос адаптерам по очереди и возвращает результат foreground-хендлера. VK-адаптер строит `Input` с `VKMessageMetadata`, базовым `InputData` и текстом; одно событие может содержать текст и payload одновременно. В metadata доступны поля VK, а для `message_new` также исходная модель `vkx.models.Message` в `msg` (`None` для callback-кнопки). Это позволяет фильтровать сообщения, например по `input.metadata.msg.peer_id` после проверки `msg is not None`. Контекст интерфейса, используемый `transition()`, остаётся внутри адаптера.
+`VKInterface` можно собрать один раз на уровне модуля и переиспользовать: адаптер не изменяет объект при отправке. `target` выбирает конкретный существующий интерфейс, `peer_id` — последний интерфейс диалога.
+
+`App.handle_input(raw)` передаёт запрос адаптерам по очереди и возвращает результат foreground-хендлера; при штатном fire-and-forget режиме возвращается `None`. VK-адаптер строит внутренний `Input` с `VKMessageMetadata`, базовым `InputData`, текстом и интерфейсом; одно событие может содержать текст и payload одновременно. В `metadata` доступны поля VK, а для `message_new` также исходная модель `vkx.models.Message` в `msg` (`None` для callback-кнопки). Текущий интерфейс события доступен как `ctx.interface`.
 
 ## Хранилища и TTL
 
 `StateStorage` — абстрактный родительский класс async-хранилищ строковых ключей/значений, TTL и `cleanup_expired()`. В комплекте:
 
 - `MemoryStorage` — для тестов и локальной разработки;
-- `JSONFileStorage(path)` — однопроцессное файловое хранение с атомарной заменой файла;
-- `RedisStorage(async_redis_client)` — duck-typed адаптер для async redis-py.
+- `JSONFileStorage(path)` — однопроцессное файловое хранение с атомарной заменой файла. Запись выполняется в отдельном потоке (`asyncio.to_thread`) и не блокирует event loop.
 
-Pydantic-модели состояния сохраняются как JSON; тип модели передаётся в `get_state(key, Model)`. Обычные dict/list/scalars можно читать без модели. `App(ttl=...)` задаёт TTL по умолчанию; у отдельного интерфейса он переопределяется через `app.new_interface(ttl=...)`. `None` означает без срока жизни. `matrix-planner` периодически вызывает обязательный `cleanup_expired()`; у Redis метод ничего не делает, потому что Redis применяет TTL самостоятельно.
+Redis-бэкенд намеренно не входит в библиотеку: прикладной слой может реализовать `StateStorage` под свой клиент. Pydantic-модели состояния сохраняются как JSON; тип модели передаётся в `get_state(key, Model)`. Обычные dict/list/scalars можно читать без модели, для словаря явно передайте `dict`. `App(ttl=...)` задаёт TTL по умолчанию; у отдельного интерфейса он переопределяется через `VKInterface(ttl=...)` или `adapter.new_interface(ttl=...)`. `None` означает без срока жизни. `matrix-planner` периодически вызывает обязательный `cleanup_expired()`.
+
+`ctx.state` — обычный JSON-объект, который автоматически сохраняется после успешного хендлера. При наличии интерфейса он хранится под стабильным `InterfaceHandle.state_key()`; при событии без интерфейса используется ключ `Adapter.context_key(metadata)`. `ctx.redraw(view)` переносит состояние на новый handle, а `ctx.redraw(None)` удаляет его вместе с интерфейсом. Для общего состояния, разделяемого несколькими интерфейсами (например, партии на двух досках), по-прежнему используйте `app.get_state`/`app.set_state`; это необязательное удобство, прикладной слой может хранить такие данные где угодно. Сам handle как ключ использовать нельзя: его `actions` и `ttl` меняются. Внутренние записи интерфейсов vkuxt хранит под непрозрачными ID адаптера, чтобы переживать перерисовки и длинные callback-payload'ы.
+
+Бизнес-состояние можно хранить Pydantic-моделью, а не словарём:
+
+```python
+class GameState(BaseModel):
+    status: Literal["active", "finished"]
+    game_id: str
+    board: list[str | None]
+    turn: int
+
+
+async with ctx.app.lock(game_key):
+    game = await ctx.app.get_state(game_key, GameState)
+    if game is None:
+        return
+    game.turn = 1 - game.turn
+    await ctx.app.set_state(game_key, game, ttl=GAME_TTL)
+```
+
+`set_state` сериализует модель в JSON, `get_state(key, GameState)` валидирует её обратно. С `JSONFileStorage` состояние переживает перезапуск приложения и снова приходит типизированным объектом; отдельного общего `app.state`-словаря нет, потому что ключ и TTL задаются явно.
+
+`JSONFileStorage` рассчитан на один процесс и один экземпляр на файл: параллельная запись из нескольких процессов или экземпляров не поддерживается. Повреждённый JSON при старте приводит к `RuntimeError` с путём файла, а не к тихой перезаписи.
 
 ```python
 from vkuxt import App, JSONFileStorage
@@ -83,17 +136,19 @@ from vkuxt import App, JSONFileStorage
 app = App(JSONFileStorage("state.json"), ttl=60 * 60 * 24)
 ```
 
-При передаче внешнего `Planner` его жизненным циклом управляет приложение-хозяин; `App.close()` снимает только задачу очистки этого приложения.
+При передаче внешнего `Planner` его жизненным циклом управляет приложение-хозяин; `App.close()` снимает только задачу очистки этого приложения. `App(close_timeout=...)` ограничивает ожидание фоновых хендлеров при остановке (по умолчанию 10 секунд); по истечении они отменяются. `App.start()` и `App.close()` сериализованы, повторный `close()` дожидается уже идущей остановки. `await app.wait_background()` ждёт завершения фоновых хендлеров, `await app.wait_adapters_started()` — запуска адаптеров, добавленных во время работы. Контейнер `app.services` свободен для сервисов приложения.
 
 ## VK Callback API
 
-`VKCallbackAdapter` и `VKMessagesAdapter` — абстрактные слои для Callback API и VK Messages. Готовый вариант объединяет их: `VKMessagesCallbackAdapter`. Адаптеры создаются приложением через `app.add_adapter(AdapterType, ...)`; `App.start()` запускает зарегистрированные адаптеры, а новые адаптеры, добавленные во время работы, запускаются асинхронно в текущем event loop. `App.close()` останавливает запущенные адаптеры в обратном порядке. Адаптер может использовать эти hooks для приёма событий или фонового опроса.
+`VKCallbackAdapter` и `VKMessagesAdapter` — абстрактные слои для Callback API и VK Messages. Готовый вариант объединяет их: `VKMessagesCallbackAdapter`. Адаптер создаётся вручную и передаётся готовым инстансом в `app.add_adapter(adapter)`; `App.start()` запускает зарегистрированные адаптеры, а новые адаптеры, добавленные во время работы, запускаются асинхронно в текущем event loop. `App.close()` останавливает запущенные адаптеры в обратном порядке. Если `messages.edit` завершился ошибкой, `redraw()` логирует её и отправляет новое сообщение вместо падения webhook'а.
 
 ```python
-adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=group_id)
+adapter = app.add_adapter(VKMessagesCallbackAdapter(app, vk, group_id=group_id))
 ```
 
-Хендлеры регистрируются через `app.handler`; фильтрация определяется аннотацией handler input, например `Input[StartData, VKMessageMetadata]`. `VKMessageInput` — сокращение для `Input[Any, VKMessageMetadata]`, если нужно принимать любой payload. `adapter.new_interface(text=..., attachments=..., kb=...)` создаёт типизированный `VKMessageTemplate`; текст ограничивается 4096 символами, вложения принимают типы VKX или VK-строки, клавиатура — модель `vkx.Keyboard` или JSON-строку. `await adapter.transition(template)` поручает адаптеру выбрать действие: редактировать сообщение callback-кнопки, отправить ответ на текст и удалить старый интерфейс либо отправить новое сообщение. `await adapter.transition(None)` удаляет текущий интерфейс.
+Хендлеры регистрируются через `app.handler`; фильтрация определяется аннотациями metadata и data, например `(ctx, metadata: VKMessageMetadata, data: StartData, text: str)`. Для любого payload используйте `data: InputData`; для текста без payload — `data: None` или `data: StartData | None`. `VKInterface(text=..., rows=..., attachments=..., ttl=...)` — конкретный интерфейс VK: текст ограничен 4096 символами, inline-клавиатура — 6 рядами по 5 кнопок. Превышение лимитов выбрасывает исключение при создании, а не усекает данные молча. Вложения принимают типы VKX или VK-строки, кнопки — модели `vkx.KeyboardButton`. `VKInterface.callback(..., color=...)` принимает `KeyboardButtonColor` или строку и проверяет допустимые значения.
+
+`await ctx.redraw(view)` выбирает интерфейс текущего события: редактирует сообщение callback-кнопки, отправляет ответ на текст и удаляет старый интерфейс либо отправляет новое сообщение. Для чужого или явно выбранного интерфейса используйте `await adapter.redraw(view, target=handle)`; `peer_id=...` выбирает последний интерфейс диалога. `await ctx.redraw(None)` удаляет текущий интерфейс. `await adapter.send(peer_id, view)` и `await adapter.edit(handle, view)` доступны для явных операций.
 
 `App.lifespan` можно передать напрямую в Starlette/FastAPI, чтобы запускать и останавливать адаптеры вместе с ASGI-приложением:
 
@@ -101,7 +156,9 @@ adapter = app.add_adapter(VKMessagesCallbackAdapter, vk, group_id=group_id)
 web = FastAPI(lifespan=app.lifespan)
 ```
 
-VK Callback адаптер использует `vkx.server.CallbackServer` для проверки входа и разбора уведомлений в модели `vkx`; установите extra `vkuxt[vk]`. Текст поступает VK-хендлерам как `Input.text`; адаптер сам определяет, было ли сообщение ответом на сохранённый интерфейс. В личных диалогах можно включить определение последнего активного интерфейса. Если callback-кнопка не привела к edit/delete именно нажатого интерфейса, адаптер отправляет `messages.sendMessageEventAnswer`.
+VK Callback адаптер использует `vkx.server.CallbackServer` для проверки входа и разбора уведомлений в модели `vkx`. Дедупликация доставленных событий — ответственность `vkx`: `CallbackServer` отбрасывает повторный `event_id` и повторную доставку `message_new` с той же парой `peer_id` + `conversation_message_id`. У `message_event` идентификатор лежит внутри `object.event_id`, поэтому адаптер дополнительно передаёт его в `CallbackServer.is_duplicate`. Текст приходит VK-хендлеру аргументом `text`; адаптер сам определяет, было ли сообщение ответом на сохранённый интерфейс. В личных диалогах можно включить определение последнего активного интерфейса. Если foreground-хендлер не привёл к edit/delete именно нажатого интерфейса, адаптер отправляет `messages.sendMessageEventAnswer`. Индекс последних интерфейсов peer'а ограничен 10 записями и получает TTL интерфейса.
+
+При fire-and-forget обработке `sendMessageEventAnswer` отправляется сразу после запуска фоновой задачи, не дожидаясь её завершения. Это укладывается в окно ответа VK; если нужен результат хендлера до ответа, используйте `background=False`, но держите такой путь коротким.
 
 Полный скетч крестиков-ноликов, включая лобби с кодом, ввод кода ответом на сообщение, две синхронизируемые доски и сдачу, находится в [`examples/tictactoe.py`](examples/tictactoe.py).
 
@@ -110,7 +167,9 @@ VK Callback адаптер использует `vkx.server.CallbackServer` дл
 ```powershell
 uv sync --extra dev
 .venv\Scripts\python.exe -m pytest
-uvx ruff check src tests examples
+.venv\Scripts\python.exe -m ruff check src tests examples
+.venv\Scripts\python.exe -m pyright
+uv build
 ```
 
-Для запуска примера установите `vkx[http]` и FastAPI, создайте `VKClient` с токеном группы, настройте публичный Callback URL, получите `app` из `make_callback_app()` и передайте его в `attach_fastapi(app)`.
+Для запуска примера установите FastAPI (он входит в extra `dev`), создайте `VKClient` с токеном группы, настройте публичный Callback URL, получите `app` из `await make_callback_app(...)` и передайте его в `attach_fastapi(app)`. Пример хранит лобби 15 минут, игры — час; чистые правила вынесены в [`examples/tictactoe_rules.py`](examples/tictactoe_rules.py) и покрыты тестами.

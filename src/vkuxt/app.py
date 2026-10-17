@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import types
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import (
     Annotated,
     Any,
-    Self,
+    ClassVar,
+    ForwardRef,
     TypeAliasType,
     TypeVar,
     Union,
@@ -22,53 +24,28 @@ from typing import (
 )
 
 from matrix_planner import Planner, every
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ValidationError
 
-from .codec import storage_key
-from .interfaces import DEFAULT_TTL, Interface, InterfaceRecord, TTLValue, _DefaultTTL
-from .locks import KeyedLockPool
+from .codec import KeyLike, encode_key, storage_key
+from .interfaces import (
+    DEFAULT_TTL,
+    Interface,
+    InterfaceHandle,
+    InterfaceRecord,
+    TTLValue,
+    _DefaultTTL,
+)
+from .locks import KeyedLockPool, LockedKeys
+from .models import BaseMetadata as BaseMetadata
+from .models import InputData as InputData
+from .models import InputModel as InputModel
 from .storage import MemoryStorage, StateStorage
+
+logger = logging.getLogger("vkuxt")
 
 StateT = TypeVar("StateT")
 AdapterT = TypeVar("AdapterT", bound="Adapter")
-InputT = TypeVar("InputT", bound="InputModel")
 Handler = Callable[..., Any]
-
-
-class InputModel(BaseModel):
-    """Валидированная модель входа; подклассы могут переопределить from_json."""
-
-    @classmethod
-    def from_json(cls: type[InputT], raw_json: str) -> InputT:
-        return cls.model_validate_json(raw_json)
-
-
-class StructuredInput(InputModel):
-    """Типизированная смысловая часть события."""
-
-    model_config = ConfigDict(validate_assignment=True)
-
-    @model_validator(mode="after")
-    def _ensure_json_serializable(self) -> Self:
-        try:
-            json.dumps(
-                self.model_dump(mode="json", warnings="error"),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-        except Exception as exc:
-            raise ValueError("StructuredInput должен сериализоваться в строгий JSON") from exc
-        return self
-
-
-class InputData(StructuredInput):
-    """База моделей типизированных данных, принимаемых хендлерами."""
-
-    model_config = ConfigDict(extra="allow", validate_assignment=True)
-
-
-class BaseMetadata(InputModel):
-    """Базовый тип для метаданных, предоставляемых адаптерами."""
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -76,12 +53,14 @@ class Input[DataT, MetadataT: BaseMetadata]:
     data: DataT
     metadata: MetadataT
     text: str | None
+    interface: InterfaceHandle[Any] | None
 
     def __init__(
         self,
         metadata: MetadataT,
         data: InputData | Mapping[str, Any] | None = None,
         text: str | None = None,
+        interface: InterfaceHandle[Any] | None = None,
     ) -> None:
         if not isinstance(metadata, BaseMetadata):
             raise TypeError("metadata должен быть BaseMetadata")
@@ -91,14 +70,36 @@ class Input[DataT, MetadataT: BaseMetadata]:
             raise TypeError("data должен быть InputData, словарём или None")
         if text is not None and not isinstance(text, str):
             raise TypeError("text должен быть строкой или None")
+        if interface is not None and not isinstance(interface, InterfaceHandle):
+            raise TypeError("interface должен быть InterfaceHandle или None")
         object.__setattr__(self, "metadata", metadata)
         object.__setattr__(self, "data", data)
         object.__setattr__(self, "text", text)
+        object.__setattr__(self, "interface", interface)
 
 
 class Adapter:
+    interface_type: ClassVar[type[Interface[Any]]] = Interface
+
     def __init__(self, app: App) -> None:
         self.app = app
+
+    def context_key(self, metadata: BaseMetadata) -> KeyLike:
+        """Ключ состояния контекста, не привязанного к интерфейсу."""
+        return {
+            "adapter": f"{type(self).__module__}.{type(self).__qualname__}",
+            "metadata": encode_key(metadata),
+        }
+
+    def new_interface(
+        self,
+        *,
+        text: str = "",
+        rows: Sequence[Sequence[Any]] = (),
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> Interface[Any]:
+        """Создать представление интерфейса, подходящее этому адаптеру."""
+        return self.interface_type(text=text, rows=rows, ttl=ttl)
 
     async def parse_input(
         self,
@@ -107,7 +108,16 @@ class Adapter:
         """Распознать сырой ввод или вернуть None, если формат неизвестен."""
 
     async def dispatch_input(self, event: Input) -> Any:
-        return await self.app.dispatch_event(event)
+        return await self.app.dispatch_event(event, self)
+
+    async def redraw(
+        self,
+        interface: Interface[Any] | None,
+        *,
+        target: InterfaceHandle[Any] | None = None,
+    ) -> InterfaceHandle[Any] | None:
+        """Перерисовать интерфейс; транспортная реализация обязательна."""
+        raise NotImplementedError("Адаптер не поддерживает redraw()")
 
     async def start(self) -> None:
         """Запустить приём событий или фоновый опрос адаптера."""
@@ -116,12 +126,61 @@ class Adapter:
         """Остановить фоновые задачи адаптера."""
 
 
+@dataclass(slots=True)
+class Context[AdapterT: Adapter = Adapter]:
+    """Контекст одного хендлера: интерфейс, состояние и доступ к приложению.
+
+    ``state`` — изменяемый JSON-объект, привязанный к текущему интерфейсу.
+    После успешного завершения хендлера он сохраняется автоматически.
+    """
+
+    app: App
+    adapter: AdapterT
+    interface: InterfaceHandle[Any] | None
+    metadata: BaseMetadata
+    state: dict[str, Any]
+    _state_key: KeyLike | None
+    _state_ttl: TTLValue = DEFAULT_TTL
+
+    async def redraw(
+        self,
+        interface: Interface[Any] | None,
+    ) -> InterfaceHandle[Any] | None:
+        """Перерисовать текущий интерфейс и перенести состояние на новый."""
+        previous = self.interface
+        previous_key = self._state_key
+        result = await self.adapter.redraw(interface, target=previous)
+        self.interface = result
+        if result is None:
+            if previous is not None and previous_key is not None:
+                await self.app.delete_state(previous_key)
+                self._state_key = None
+                self._state_ttl = DEFAULT_TTL
+            return None
+
+        new_key = result.state_key()
+        if new_key != previous_key:
+            await self.app.set_state(new_key, self.state, ttl=result.ttl)
+            if previous_key is not None and (
+                previous is None
+                or await self.app._get_interface_record(previous.id) is None
+            ):
+                await self.app.delete_state(previous_key)
+            self._state_key = new_key
+        self._state_ttl = result.ttl
+        return result
+
+    async def _save(self) -> None:
+        if self._state_key is not None:
+            await self.app.set_state(self._state_key, self.state, ttl=self._state_ttl)
+
+
 @dataclass(frozen=True, slots=True)
 class _HandlerEntry:
     background: bool
     function: Handler
-    order: int
-    data_models: tuple[type[InputData], ...] | None
+    metadata_types: tuple[type[BaseMetadata], ...]
+    data_models: tuple[type[InputData], ...]
     accepts_missing_data: bool
 
 
@@ -137,26 +196,32 @@ class App:
         ttl: float | None = None,
         planner: Planner | None = None,
         tokenize_long_input: bool = True,
+        close_timeout: float | None = 10.0,
     ) -> None:
         if ttl is not None and ttl <= 0:
             raise ValueError("ttl должен быть больше нуля или None")
+        if close_timeout is not None and close_timeout <= 0:
+            raise ValueError("close_timeout должен быть больше нуля или None")
         self.storage = storage if storage is not None else MemoryStorage()
         self.ttl = ttl
         self.tokenize_long_input = tokenize_long_input
+        self.close_timeout = close_timeout
         self.planner = planner if planner is not None else Planner()
         self._owns_planner = planner is None
         self._handlers: list[_HandlerEntry] = []
-        self._handlers_by_metadata: dict[type[BaseMetadata], list[_HandlerEntry]] = {}
-        self._handlers_without_metadata_filter: list[_HandlerEntry] = []
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._locks = KeyedLockPool()
+        # Свободный контейнер для сервисов приложения; vkuxt его не использует.
         self.services: dict[str, Any] = {}
         self._adapters: list[Adapter] = []
         self._started_adapters: list[Adapter] = []
         self._adapter_start_tasks: set[asyncio.Task[None]] = set()
         self._adapter_start_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._running = False
         self._closing = False
+        self._closed = False
+        self._close_owner: asyncio.Task[Any] | None = None
         self._cleanup_task = self.planner.task(
             every("1m"),
             name=f"vkuxt-storage-cleanup-{id(self)}",
@@ -174,11 +239,15 @@ class App:
 
     def add_adapter(
         self,
-        adapter_type: type[AdapterT],
+        adapter: AdapterT,
         /,
-        *args: Any,
-        **kwargs: Any,
     ) -> AdapterT:
+        if not isinstance(adapter, Adapter):
+            raise TypeError("add_adapter ожидает экземпляр Adapter")
+        if adapter.app is not self:
+            raise ValueError("Адаптер принадлежит другому App")
+        if any(existing is adapter for existing in self._adapters):
+            raise ValueError("Адаптер уже добавлен")
         if self._closing:
             raise RuntimeError("Нельзя добавлять адаптер во время остановки приложения")
         loop = None
@@ -189,7 +258,6 @@ class App:
                 raise RuntimeError(
                     "Добавление адаптера во время работы требует активного event loop"
                 ) from exc
-        adapter = adapter_type(self, *args, **kwargs)
         self._adapters.append(adapter)
         if loop is not None:
             task = loop.create_task(self._start_adapter(adapter))
@@ -199,21 +267,17 @@ class App:
 
     def add_handler(self, function: Handler, *, background: bool = True) -> Handler:
         localns = _caller_localns(function)
-        annotation = _handler_input_annotation(function, localns)
-        metadata_types, data_models, accepts_missing_data = _handler_input_types(annotation)
+        metadata_types, data_models, accepts_missing_data = _handler_annotations(
+            function, localns
+        )
         entry = _HandlerEntry(
             background=background,
             function=function,
-            order=len(self._handlers),
+            metadata_types=metadata_types,
             data_models=data_models,
             accepts_missing_data=accepts_missing_data,
         )
         self._handlers.append(entry)
-        if metadata_types is None:
-            self._handlers_without_metadata_filter.append(entry)
-        else:
-            for metadata_type in metadata_types:
-                self._handlers_by_metadata.setdefault(metadata_type, []).append(entry)
         return function
 
     @overload
@@ -227,92 +291,100 @@ class App:
             return lambda registered: self.add_handler(registered, background=background)
         return self.add_handler(function, background=background)
 
-    async def dispatch_event(self, _input: Input) -> Any:
+    async def dispatch_event(self, _input: Input, adapter: Adapter) -> Any:
+        if self._closing:
+            raise RuntimeError("Приложение останавливается")
         entries = self._matching_handlers(_input.metadata)
+        payload = _input.data.model_dump(mode="python") if _input.data is not None else None
+        cache: dict[type[InputData], InputData | None] = {}
         for entry in entries:
             if not entry.background:
-                handler_input = self._input_for_handler(entry, _input)
-                if handler_input is None:
+                matched, data = self._data_for_handler(entry, payload, cache)
+                if not matched:
                     continue
                 try:
-                    result = await self._invoke(entry, handler_input)
+                    result = await self._invoke(entry, adapter, _input, data)
                 except StopHandlerChain:
                     break
                 if result is not None:
                     return result
 
-        background_entries = []
+        background_entries: list[tuple[_HandlerEntry, InputData | None]] = []
         for entry in entries:
             if not entry.background:
                 continue
-            handler_input = self._input_for_handler(entry, _input)
-            if handler_input is not None:
-                background_entries.append((entry, handler_input))
+            matched, data = self._data_for_handler(entry, payload, cache)
+            if matched:
+                background_entries.append((entry, data))
         if background_entries:
-            task = asyncio.create_task(self._run_background_handlers(tuple(background_entries)))
+            task = asyncio.create_task(
+                self._run_background_handlers(tuple(background_entries), adapter, _input)
+            )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_task_done)
         return None
 
     async def _run_background_handlers(
         self,
-        entries: tuple[tuple[_HandlerEntry, Input], ...],
+        entries: tuple[tuple[_HandlerEntry, InputData | None], ...],
+        adapter: Adapter,
+        event: Input,
     ) -> None:
-        for entry, handler_input in entries:
+        for entry, data in entries:
             try:
-                await self._invoke(entry, handler_input)
+                await self._invoke(entry, adapter, event, data)
             except StopHandlerChain:
                 return
 
     def _matching_handlers(self, metadata: BaseMetadata) -> tuple[_HandlerEntry, ...]:
-        entries = {entry.order: entry for entry in self._handlers_without_metadata_filter}
-        for metadata_type in type(metadata).__mro__:
-            for entry in self._handlers_by_metadata.get(metadata_type, ()):
-                entries[entry.order] = entry
-        return tuple(sorted(entries.values(), key=lambda entry: entry.order))
+        return tuple(
+            entry
+            for entry in self._handlers
+            if isinstance(metadata, entry.metadata_types)
+        )
 
     @staticmethod
-    def _input_for_handler(entry: _HandlerEntry, event: Input) -> Input | None:
-        if entry.data_models is None:
-            return event
-        if event.data is None:
-            if entry.accepts_missing_data:
-                return event
-            return None
+    def _data_for_handler(
+        entry: _HandlerEntry,
+        payload: dict[str, Any] | None,
+        cache: dict[type[InputData], InputData | None],
+    ) -> tuple[bool, InputData | None]:
+        if payload is None:
+            return entry.accepts_missing_data, None
 
-        payload = event.data.model_dump(mode="python")
         for model in entry.data_models:
-            try:
-                data = model.model_validate(payload)
-            except ValidationError:
-                continue
-            return Input(event.metadata, data=data, text=event.text)
-        return None
+            if model in cache:
+                data = cache[model]
+            else:
+                try:
+                    data = model.model_validate(payload)
+                except ValidationError:
+                    data = None
+                cache[model] = data
+            if data is not None:
+                return True, data
+        return False, None
 
     def _background_task_done(self, task: asyncio.Task[Any]) -> None:
         self._background_tasks.discard(task)
         if task.cancelled():
             return
         if exception := task.exception():
-            task.get_loop().call_exception_handler(
-                {"message": "Background input handler failed", "exception": exception, "task": task}
-            )
+            logger.error("Фоновый хендлер завершился с ошибкой", exc_info=exception)
 
     def _adapter_start_done(self, task: asyncio.Task[None]) -> None:
         self._adapter_start_tasks.discard(task)
         if task.cancelled():
             return
         if exception := task.exception():
-            task.get_loop().call_exception_handler(
-                {"message": "Adapter startup failed", "exception": exception, "task": task}
-            )
+            logger.error("Не удалось запустить адаптер", exc_info=exception)
 
     async def _start_adapter(self, adapter: Adapter) -> None:
         async with self._adapter_start_lock:
-            if adapter in self._started_adapters:
+            if self._closing or self._closed or adapter in self._started_adapters:
                 return
-            self._started_adapters.append(adapter)
             await adapter.start()
+            self._started_adapters.append(adapter)
 
     async def _wait_for_adapter_starts(self) -> None:
         while self._adapter_start_tasks:
@@ -320,62 +392,129 @@ class App:
             await asyncio.gather(*tasks, return_exceptions=True)
             self._adapter_start_tasks.difference_update(tasks)
 
-    async def _invoke(self, entry: _HandlerEntry, _input: Input) -> Any:
-        result = entry.function(self, _input)
-        return await result if inspect.isawaitable(result) else result
+    async def wait_adapters_started(self) -> None:
+        """Дождаться завершения запуска адаптеров, добавленных во время работы."""
+        await self._wait_for_adapter_starts()
+
+    async def wait_background(self) -> None:
+        """Дождаться завершения всех запущенных фоновых хендлеров."""
+        while self._background_tasks:
+            tasks = tuple(self._background_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.difference_update(tasks)
+
+    async def _context_for(
+        self,
+        adapter: Adapter,
+        event: Input,
+    ) -> Context[Any]:
+        interface = event.interface
+        if interface is not None:
+            state_key: KeyLike = interface.state_key()
+            state_ttl: TTLValue = interface.ttl
+        else:
+            state_key = adapter.context_key(event.metadata)
+            state_ttl = self.ttl
+        state = await self.get_state(state_key, dict)
+        if state is None:
+            state = {}
+        elif not isinstance(state, dict):
+            raise TypeError("Состояние контекста должно быть JSON-объектом")
+        return Context(
+            app=self,
+            adapter=adapter,
+            interface=interface,
+            metadata=event.metadata,
+            state=state,
+            _state_key=state_key,
+            _state_ttl=state_ttl,
+        )
+
+    async def _invoke(
+        self,
+        entry: _HandlerEntry,
+        adapter: Adapter,
+        event: Input,
+        data: InputData | None,
+    ) -> Any:
+        context = await self._context_for(adapter, event)
+        try:
+            result = entry.function(
+                context,
+                event.metadata,
+                data,
+                event.text or "",
+            )
+            result = await result if inspect.isawaitable(result) else result
+        except StopHandlerChain:
+            await context._save()
+            raise
+        await context._save()
+        return result
 
     async def handle_input(self, raw: str | bytes | Mapping[str, Any]) -> Any:
+        if self._closing:
+            raise RuntimeError("Приложение останавливается")
         for adapter in self._adapters:
             event = await adapter.parse_input(raw)
             if event is not None:
                 return await adapter.dispatch_input(event)
         return None
 
-    def new_interface(self, *, ttl: TTLValue = DEFAULT_TTL) -> Interface:
-        return Interface(ttl=ttl, tokenize_long_input=self.tokenize_long_input)
-
-    async def register_interface(self, external_id: Any, interface: Interface) -> None:
+    async def _register_interface(
+        self,
+        external_id: KeyLike,
+        actions: dict[str, dict[str, Any]],
+        ttl: TTLValue,
+    ) -> float | None:
         interface_key = storage_key("interface", external_id)
         old_record = (
             InterfaceRecord.from_json_data(json.loads(raw))
             if (raw := await self.storage.get(interface_key)) is not None
             else None
         )
-        if isinstance(interface.ttl, _DefaultTTL):
-            ttl = old_record.ttl if old_record is not None else self.ttl
-        else:
-            ttl = interface.ttl
-        if ttl is not None and ttl <= 0:
+        default_ttl = old_record.ttl if old_record is not None else self.ttl
+        lifetime = default_ttl if isinstance(ttl, _DefaultTTL) else ttl
+        if lifetime is not None and lifetime <= 0:
             raise ValueError("ttl должен быть больше нуля или None")
-        record = InterfaceRecord(dict(interface.actions), ttl)
-        await self.storage.set(interface_key, _json(record.to_json_data()), ttl=ttl)
+        record = InterfaceRecord(dict(actions), lifetime)
+        await self.storage.set(interface_key, _json(record.to_json_data()), ttl=lifetime)
+        return lifetime
 
-    async def get_interface(self, external_id: Any) -> InterfaceRecord | None:
+    async def _get_interface_record(self, external_id: KeyLike) -> InterfaceRecord | None:
         raw = await self.storage.get(storage_key("interface", external_id))
         return InterfaceRecord.from_json_data(json.loads(raw)) if raw is not None else None
 
-    async def remove_interface(self, external_id: Any) -> None:
+    async def _remove_interface_record(self, external_id: KeyLike) -> None:
         await self.storage.delete(storage_key("interface", external_id))
 
-    async def get_state(self, key: Any, model: type[StateT] | None = None) -> Any | None:
+    @overload
+    async def get_state(self, key: KeyLike, model: None = None) -> Any | None: ...
+
+    @overload
+    async def get_state(self, key: KeyLike, model: type[StateT]) -> StateT | None: ...
+
+    async def get_state(
+        self, key: KeyLike, model: type[StateT] | None = None
+    ) -> Any | None:
         raw = await self.storage.get(storage_key("state", key))
         if raw is None:
             return None
         if model is None:
             return json.loads(raw)
         data = json.loads(raw)
+        if model is dict:
+            return data
         if isinstance(model, type) and issubclass(model, BaseModel):
             return model.model_validate(data)
         if hasattr(model, "from_json"):
             return model.from_json(raw)  # type: ignore[attr-defined, no-any-return]
         return model(**data)  # type: ignore[call-arg, no-any-return]
 
-    async def set_state(self, key: Any, value: Any, *, ttl: TTLValue = DEFAULT_TTL) -> None:
+    async def set_state(self, key: KeyLike, value: Any, *, ttl: TTLValue = DEFAULT_TTL) -> None:
         if isinstance(value, BaseModel) or hasattr(value, "model_dump"):
             data = value.model_dump(mode="json")
-        elif hasattr(value, "__dataclass_fields__"):
-            from dataclasses import asdict
-
+        elif is_dataclass(value) and not isinstance(value, type):
             data = asdict(value)
         else:
             data = value
@@ -384,68 +523,91 @@ class App:
             raise ValueError("ttl должен быть больше нуля или None")
         await self.storage.set(storage_key("state", key), _json(data), ttl=lifetime)
 
-    async def delete_state(self, key: Any) -> None:
+    async def delete_state(self, key: KeyLike) -> None:
         await self.storage.delete(storage_key("state", key))
 
-    def lock(self, *keys: Any):
+    def lock(self, *keys: KeyLike) -> LockedKeys:
         return self._locks.lock(*keys)
 
     async def start(self) -> None:
-        if self._closing:
-            raise RuntimeError("Нельзя запустить приложение во время остановки")
-        if self._running:
-            return
-        adapters = tuple(self._adapters)
-        self._running = True
-        try:
-            if self._owns_planner:
-                await self.planner.start()
-            for adapter in adapters:
-                await self._start_adapter(adapter)
-        except (Exception, asyncio.CancelledError) as startup_error:
+        async with self._lifecycle_lock:
+            if self._closing:
+                raise RuntimeError("Нельзя запустить приложение во время остановки")
+            if self._running:
+                return
+            adapters = tuple(self._adapters)
+            self._running = True
+            self._closed = False
             try:
-                await self._wait_for_adapter_starts()
-                await self._stop_adapters()
-            except (Exception, asyncio.CancelledError) as close_error:  # noqa: BLE001
-                startup_error.add_note(
-                    f"Ошибка остановки адаптера после сбоя запуска: {close_error!r}"
-                )
-            finally:
+                if self._owns_planner:
+                    await self.planner.start()
+                for adapter in adapters:
+                    await self._start_adapter(adapter)
+            except (Exception, asyncio.CancelledError) as startup_error:
                 try:
-                    if self._owns_planner:
-                        await self.planner.stop()
-                    else:
-                        await self.planner.remove(self._cleanup_task.task_id)
-                except (Exception, asyncio.CancelledError) as planner_error:  # noqa: BLE001
+                    await self._wait_for_adapter_starts()
+                    await self._stop_adapters()
+                except (Exception, asyncio.CancelledError) as close_error:  # noqa: BLE001
                     startup_error.add_note(
-                        f"Ошибка остановки planner после сбоя запуска: {planner_error!r}"
+                        f"Ошибка остановки адаптера после сбоя запуска: {close_error!r}"
                     )
-                self._running = False
-            raise
+                finally:
+                    try:
+                        if self._owns_planner:
+                            await self.planner.stop()
+                        else:
+                            await self.planner.remove(self._cleanup_task.task_id)
+                    except (Exception, asyncio.CancelledError) as planner_error:  # noqa: BLE001
+                        startup_error.add_note(
+                            f"Ошибка остановки planner после сбоя запуска: {planner_error!r}"
+                        )
+                    self._running = False
+                raise
 
     async def close(self) -> None:
-        if self._closing:
+        current = asyncio.current_task()
+        if self._closing and (
+            current is self._close_owner or current in self._background_tasks
+        ):
+            # Повторный close() из адаптера или фонового хендлера не должен
+            # ждать close(), который сам его вызвал.
             return
-        self._closing = True
-        self._running = False
-        try:
-            try:
-                await self._wait_for_adapter_starts()
-                await self._stop_adapters()
-            finally:
-                try:
-                    while self._background_tasks:
-                        await asyncio.gather(
-                            *tuple(self._background_tasks), return_exceptions=True
-                        )
-                finally:
-                    if self._owns_planner:
-                        await self.planner.stop()
-                    else:
-                        await self.planner.remove(self._cleanup_task.task_id)
-        finally:
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closing = True
+            self._close_owner = current
             self._running = False
-            self._closing = False
+            try:
+                try:
+                    await self._wait_for_adapter_starts()
+                    await self._stop_adapters()
+                finally:
+                    try:
+                        await self._drain_background_tasks()
+                    finally:
+                        if self._owns_planner:
+                            await self.planner.stop()
+                        else:
+                            await self.planner.remove(self._cleanup_task.task_id)
+            finally:
+                self._running = False
+                self._closing = False
+                self._closed = True
+                self._close_owner = None
+
+    async def _drain_background_tasks(self) -> None:
+        current = asyncio.current_task()
+        tasks = tuple(task for task in self._background_tasks if task is not current)
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(tasks, timeout=self.close_timeout)
+        if pending:
+            logger.warning("Отменяю %d фоновых задач по таймауту", len(pending))
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._background_tasks.difference_update(tasks)
 
     async def _stop_adapters(self) -> None:
         shutdown_error: BaseException | None = None
@@ -487,51 +649,75 @@ def _caller_localns(function: Handler) -> dict[str, Any]:
     try:
         frame = frame.f_back if frame is not None else None
         while frame is not None:
-            frames.append(frame)
+            module = frame.f_globals.get("__name__", "")
+            if module != "vkuxt" and not module.startswith("vkuxt."):
+                frames.append(frame)
             frame = frame.f_back
-        for frame in reversed(frames):
-            localns.update(frame.f_locals)
+        for external_frame in reversed(frames):
+            localns.update(external_frame.f_locals)
     finally:
         del frame
     return localns
 
 
-def _handler_input_annotation(function: Handler, localns: dict[str, Any]) -> Any:
+def _handler_annotations(
+    function: Handler,
+    localns: dict[str, Any],
+) -> tuple[tuple[type[BaseMetadata], ...], tuple[type[InputData], ...], bool]:
     try:
+        all_parameters = list(inspect.signature(function).parameters.values())
         parameters = [
             parameter
-            for parameter in inspect.signature(function).parameters.values()
+            for parameter in all_parameters
             if parameter.kind
             in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
         ]
-    except (TypeError, ValueError):
-        return inspect.Signature.empty
-    if not parameters:
-        return inspect.Signature.empty
-    parameter = parameters[1] if len(parameters) > 1 else parameters[0]
-    annotation = parameter.annotation
-    if annotation is inspect.Signature.empty:
-        return annotation
-
-    try:
-        hints = get_type_hints(
-            function,
-            globalns=getattr(function, "__globals__", {}),
-            localns=localns,
+    except (TypeError, ValueError) as exc:
+        raise TypeError("Не удалось прочитать сигнатуру хендлера") from exc
+    if len(all_parameters) != 4 or len(parameters) != 4:
+        raise TypeError(
+            "Хендлер должен принимать ровно четыре позиционных аргумента: "
+            "ctx, metadata, data, text"
         )
-    except (NameError, TypeError):
-        if isinstance(annotation, str):
-            try:
-                return eval(annotation, getattr(function, "__globals__", {}), localns)
-            except (NameError, SyntaxError, TypeError):
-                return annotation
-        return annotation
-    return hints.get(parameter.name, annotation)
+
+    globalns = getattr(function, "__globals__", {})
+    try:
+        hints = get_type_hints(function, globalns=globalns, localns=localns)
+    except (NameError, TypeError) as exc:
+        raise TypeError(
+            f"Не удалось разрешить аннотации хендлера "
+            f"{getattr(function, '__qualname__', function)!r}"
+        ) from exc
+
+    metadata_annotation = hints.get(parameters[1].name, parameters[1].annotation)
+    data_annotation = hints.get(parameters[2].name, parameters[2].annotation)
+    text_annotation = hints.get(parameters[3].name, parameters[3].annotation)
+    ctx_annotation = _unwrap_annotation(
+        hints.get(parameters[0].name, parameters[0].annotation)
+    )
+    ctx_type = get_origin(ctx_annotation) or ctx_annotation
+    if ctx_type not in (inspect.Signature.empty, Any) and not (
+        isinstance(ctx_type, type) and issubclass(ctx_type, Context)
+    ):
+        raise TypeError("Аннотация ctx должна быть Context")
+
+    metadata_types = _metadata_annotation_types(metadata_annotation)
+    data_models, accepts_missing_data = _data_annotation_types(data_annotation)
+    if _unwrap_annotation(text_annotation) is not str:
+        raise TypeError("Аннотация text должна быть str")
+    return metadata_types, data_models, accepts_missing_data
 
 
 def _expand_type_alias(annotation: Any) -> Any:
     while isinstance(annotation, TypeAliasType):
         annotation = annotation.__value__
+    return annotation
+
+
+def _unwrap_annotation(annotation: Any) -> Any:
+    annotation = _expand_type_alias(annotation)
+    while get_origin(annotation) is Annotated:
+        annotation = _expand_type_alias(get_args(annotation)[0])
     return annotation
 
 
@@ -548,45 +734,51 @@ def _type_alternatives(annotation: Any) -> tuple[Any, ...]:
     return (annotation,)
 
 
-def _handler_input_types(
+def _metadata_annotation_types(annotation: Any) -> tuple[type[BaseMetadata], ...]:
+    annotation = _unwrap_annotation(annotation)
+    if annotation is inspect.Signature.empty:
+        raise TypeError("Аннотация metadata обязательна")
+    if isinstance(annotation, (str, ForwardRef)):
+        raise TypeError(
+            f"Не удалось разрешить аннотацию metadata {annotation!r}"
+        )
+    if annotation in (Any, object):
+        raise TypeError(
+            "Аннотация metadata должна указывать BaseMetadata или Union моделей metadata"
+        )
+
+    metadata_types: list[type[BaseMetadata]] = []
+    for metadata_type in _type_alternatives(annotation):
+        if not isinstance(metadata_type, type) or not issubclass(metadata_type, BaseMetadata):
+            raise TypeError("Типы metadata должны наследоваться от BaseMetadata")
+        if metadata_type not in metadata_types:
+            metadata_types.append(metadata_type)
+    return tuple(metadata_types)
+
+
+def _data_annotation_types(
     annotation: Any,
-) -> tuple[tuple[type[BaseMetadata], ...] | None, tuple[type[InputData], ...] | None, bool]:
-    annotation = _expand_type_alias(annotation)
-    if annotation in (inspect.Signature.empty, Any, object, Input):
-        return None, None, True
-    if get_origin(annotation) is not Input:
-        return None, None, True
-
-    arguments = get_args(annotation)
-    if len(arguments) != 2:
-        raise TypeError("Аннотация ввода должна иметь вид Input[МодельДанных, ТипМетаданных]")
-    data_annotation, metadata_annotation = arguments
-
-    if metadata_annotation in (Any, object):
-        metadata_types = None
-    else:
-        metadata_types_list: list[type[BaseMetadata]] = []
-        for metadata_type in _type_alternatives(metadata_annotation):
-            if not isinstance(metadata_type, type) or not issubclass(metadata_type, BaseMetadata):
-                raise TypeError("Типы metadata должны наследоваться от BaseMetadata")
-            if metadata_type not in metadata_types_list:
-                metadata_types_list.append(metadata_type)
-        metadata_types = tuple(metadata_types_list)
-
-    if data_annotation in (Any, object):
-        return metadata_types, None, True
-
+) -> tuple[tuple[type[InputData], ...], bool]:
+    annotation = _unwrap_annotation(annotation)
+    if annotation is inspect.Signature.empty:
+        raise TypeError("Аннотация data обязательна")
+    if isinstance(annotation, (str, ForwardRef)):
+        raise TypeError(f"Не удалось разрешить аннотацию data {annotation!r}")
+    if annotation in (Any, object):
+        raise TypeError(
+            "Аннотация data должна указывать InputData, None или Union моделей"
+        )
     data_models: list[type[InputData]] = []
     accepts_missing_data = False
-    for data_type in _type_alternatives(data_annotation):
+    for data_type in _type_alternatives(annotation):
         if data_type is type(None):
             accepts_missing_data = True
         elif isinstance(data_type, type) and issubclass(data_type, InputData):
             if data_type not in data_models:
                 data_models.append(data_type)
         else:
-            raise TypeError("Типы data должны быть моделями InputData, None или Any")
-    return metadata_types, tuple(data_models), accepts_missing_data
+            raise TypeError("Типы data должны быть моделями InputData или None")
+    return tuple(data_models), accepts_missing_data
 
 
 def _json(value: Any) -> str:

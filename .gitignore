@@ -163,3 +163,4 @@ cython_debug/
 .idea/
 /*.py
 /uv.lock
+AGENTS.md

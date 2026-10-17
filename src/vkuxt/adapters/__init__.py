@@ -1,19 +1,21 @@
 from .vk import (
     VKCallbackAdapter,
+    VKInterface,
     VKMessageInput,
+    VKMessageInterface,
     VKMessageInterfaceId,
     VKMessageMetadata,
     VKMessagesAdapter,
     VKMessagesCallbackAdapter,
-    VKMessageTemplate,
 )
 
 __all__ = [
     "VKCallbackAdapter",
+    "VKInterface",
     "VKMessageInput",
+    "VKMessageInterface",
     "VKMessageInterfaceId",
     "VKMessageMetadata",
-    "VKMessageTemplate",
     "VKMessagesAdapter",
     "VKMessagesCallbackAdapter",
 ]
