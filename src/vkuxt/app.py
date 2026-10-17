@@ -99,7 +99,7 @@ class Adapter:
         ttl: TTLValue = DEFAULT_TTL,
     ) -> Interface[Any]:
         """Создать представление интерфейса, подходящее этому адаптеру."""
-        return self.interface_type(text=text, rows=rows, ttl=ttl)
+        return self.interface_type(text=text, kb=rows, ttl=ttl)
 
     async def parse_input(
         self,

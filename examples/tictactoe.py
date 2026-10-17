@@ -107,7 +107,7 @@ def menu_view(uid: int) -> VKInterface:
     return VKInterface(
         text="Крестики-нолики. Выберите действие:",
         ttl=LOBBY_TTL,
-        rows=[
+        kb=[
             [
                 VKInterface.callback(
                     "Создать игру",
@@ -133,7 +133,7 @@ def lobby_view(code: str) -> VKInterface:
     return VKInterface(
         text=f"Ожидаем второго игрока. Код игры: {code}",
         ttl=LOBBY_TTL,
-        rows=[
+        kb=[
             [
                 VKInterface.callback(
                     "Покинуть подбор",
@@ -149,7 +149,7 @@ def join_prompt_view(uid: int) -> VKInterface:
     return VKInterface(
         text="Введите код игры ответом на это сообщение:",
         ttl=LOBBY_TTL,
-        rows=[
+        kb=[
             [
                 VKInterface.callback(
                     "Закрыть",
@@ -227,7 +227,7 @@ def game_view(game: GameState, seat: int) -> VKInterface:
             ]
         ]
         text = f"{rendered_board}\n\nИгра завершена. {result}"
-    return VKInterface(text=text, rows=rows, ttl=GAME_TTL)
+    return VKInterface(text=text, kb=rows, ttl=GAME_TTL)
 
 
 async def menu(

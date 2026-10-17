@@ -792,8 +792,8 @@ def test_unresolved_handler_annotation_is_rejected() -> None:
 
 
 def test_interface_base_normalizes_rows_and_defaults() -> None:
-    view = Interface(text="screen", rows=[[1, 2], [3]])
-    assert view.rows == ((1, 2), (3,))
+    view = Interface(text="screen", kb=[[1, 2], [3]])
+    assert view.kb == ((1, 2), (3,))
     assert view.ttl is DEFAULT_TTL
 
 

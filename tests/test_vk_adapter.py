@@ -413,7 +413,7 @@ def test_only_oversized_button_payloads_are_tokenized() -> None:
             5,
             VKInterface(
                 text="hello",
-                rows=[
+                kb=[
                     [VKInterface.callback("compact", compact)],
                     [VKInterface.callback("unicode-compact", unicode_compact)],
                     [VKInterface.callback("unicode-long", unicode_long)],
@@ -452,7 +452,7 @@ def test_only_oversized_button_payloads_are_tokenized() -> None:
             5,
             VKInterface(
                 text="hello",
-                rows=[[VKInterface.callback("long", long)]],
+                kb=[[VKInterface.callback("long", long)]],
             ),
         )
         assert disabled_interface.actions == {}
@@ -472,7 +472,7 @@ def test_auto_tokenized_payload_survives_restart(tmp_path) -> None:
             5,
             VKInterface(
                 text="press",
-                rows=[
+                kb=[
                     [
                         VKInterface.callback(
                             "go",
@@ -743,7 +743,7 @@ def test_handler_receives_source_interface_object() -> None:
             5,
             VKInterface(
                 text="choose",
-                rows=[[VKInterface.callback("edit", StartInput(
+                kb=[[VKInterface.callback("edit", StartInput(
                     handler_name="begin-action",
                     source="button",
                 ))]],
@@ -792,14 +792,14 @@ def test_prebuilt_interface_is_not_mutated_and_can_be_reused() -> None:
         adapter = add_vk_adapter(app, vk)
         view = VKInterface(
             text="static",
-            rows=[[VKInterface.callback("go", {"handler_name": "begin-action", "source": "x" * 300})]],
+            kb=[[VKInterface.callback("go", {"handler_name": "begin-action", "source": "x" * 300})]],
         )
-        original_payload = view.rows[0][0].action.payload
+        original_payload = view.kb[0][0].action.payload
 
         first = await adapter.send(5, view)
         second = await adapter.send(6, view)
 
-        assert view.rows[0][0].action.payload == original_payload
+        assert view.kb[0][0].action.payload == original_payload
         assert first.actions != second.actions
         first_keyboard = json.loads(vk.messages.sent[0]["keyboard"])
         second_keyboard = json.loads(vk.messages.sent[1]["keyboard"])
@@ -816,13 +816,13 @@ def test_vk_interface_validates_transport_limits() -> None:
     with pytest.raises(ValueError, match="4096"):
         VKInterface(text="x" * 4097)
     with pytest.raises(ValueError, match="6 рядов"):
-        VKInterface(rows=[[VKInterface.callback(str(i))] for i in range(7)])
+        VKInterface(kb=[[VKInterface.callback(str(i))] for i in range(7)])
     with pytest.raises(ValueError, match="пустой"):
-        VKInterface(rows=[[]])
+        VKInterface(kb=[[]])
     with pytest.raises(ValueError, match="5 кнопок"):
-        VKInterface(rows=[[VKInterface.callback(str(i)) for i in range(6)]])
+        VKInterface(kb=[[VKInterface.callback(str(i)) for i in range(6)]])
     with pytest.raises(TypeError, match="KeyboardButton"):
-        VKInterface(rows=[["not-a-button"]])  # type: ignore[list-item]
+        VKInterface(kb=[["not-a-button"]])  # type: ignore[list-item]
 
 
 def test_vk_callback_accepts_only_known_colors() -> None:
@@ -835,7 +835,7 @@ def test_vk_callback_accepts_only_known_colors() -> None:
     with pytest.raises(ValueError, match="допустимо"):
         VKInterface.callback("bad", color="NOT_SUPPORTED")
     with pytest.raises(ValueError, match="допустимо"):
-        VKInterface(rows=[[Button.callback("bad", color="red")]])
+        VKInterface(kb=[[Button.callback("bad", color="red")]])
 
 
 def test_redraw_revalidates_a_mutated_interface() -> None:

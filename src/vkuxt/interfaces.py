@@ -25,7 +25,7 @@ class Interface[ButtonT]:
     """
 
     text: str = ""
-    rows: Sequence[Sequence[ButtonT]] = ()
+    kb: Sequence[Sequence[ButtonT]] = ()
     ttl: TTLValue = DEFAULT_TTL
 
     def __post_init__(self) -> None:
@@ -36,11 +36,11 @@ class Interface[ButtonT]:
         if not isinstance(self.text, str):
             raise TypeError("text интерфейса должен быть строкой")
         normalized_rows: list[tuple[ButtonT, ...]] = []
-        for index, row in enumerate(self.rows):
+        for index, row in enumerate(self.kb):
             if isinstance(row, (str, bytes, bytearray)):
                 raise TypeError(f"ряд кнопок {index} должен быть последовательностью, а не строкой")
             normalized_rows.append(tuple(row))
-        self.rows = tuple(normalized_rows)
+        self.kb = tuple(normalized_rows)
         if (
             not isinstance(self.ttl, _DefaultTTL)
             and self.ttl is not None

@@ -95,11 +95,11 @@ class VKInterface(Interface[KeyboardButton]):
             raise ValueError(
                 f"текст VK-интерфейса не должен превышать {_VK_TEXT_LIMIT} символов"
             )
-        if len(self.rows) > _VK_INLINE_ROWS_LIMIT:
+        if len(self.kb) > _VK_INLINE_ROWS_LIMIT:
             raise ValueError(
                 f"inline-клавиатура VK: не больше {_VK_INLINE_ROWS_LIMIT} рядов"
             )
-        for index, row in enumerate(self.rows):
+        for index, row in enumerate(self.kb):
             if not row:
                 raise ValueError(f"inline-клавиатура VK: ряд {index} пустой")
             if len(row) > _VK_ROW_BUTTONS_LIMIT:
@@ -121,7 +121,7 @@ class VKInterface(Interface[KeyboardButton]):
 
     @property
     def keyboard(self) -> Keyboard:
-        return Keyboard.from_rows([list(row) for row in self.rows])
+        return Keyboard.from_rows([list(row) for row in self.kb])
 
     @classmethod
     def callback(
@@ -233,7 +233,7 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         attachments: AttachmentsInput | None = None,
         ttl: TTLValue = DEFAULT_TTL,
     ) -> VKInterface:
-        return VKInterface(text=text, rows=rows, ttl=ttl, attachments=attachments)
+        return VKInterface(text=text, kb=rows, ttl=ttl, attachments=attachments)
 
     async def send(
         self,
@@ -366,7 +366,7 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         actions: dict[str, dict[str, Any]] = {}
         rows = [
             [self._prepare_button(button, actions) for button in row]
-            for row in view.rows
+            for row in view.kb
         ]
         return _PreparedVKInterface(Keyboard.from_rows(rows), actions)
 
@@ -411,7 +411,7 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             random_id=secrets.randbelow(2**31),
             group_id=self.group_id,
             message=view.text,
-            keyboard=prepared.keyboard.to_json() if view.rows else None,
+            keyboard=prepared.keyboard.to_json() if view.kb else None,
             attachment=view.attachments,
             reply_to=reply_to,
         )

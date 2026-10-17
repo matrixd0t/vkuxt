@@ -53,10 +53,10 @@ class Greeting(InputData):
 
 @app.handler
 async def greeting(
-    ctx: Context,
-    metadata: VKMessageMetadata,
-    data: Greeting | None,
-    text: str,
+        ctx: Context,
+        metadata: VKMessageMetadata,
+        data: Greeting | None,
+        text: str,
 ) -> None:
     if data is not None:
         message = data.text
@@ -68,7 +68,7 @@ async def greeting(
     await ctx.redraw(
         VKInterface(
             text=f"{message}, {metadata.user_id}",
-            rows=[[VKInterface.callback("Ещё", Greeting(text="кнопка"))]],
+            kb=[[VKInterface.callback("Ещё", Greeting(text="кнопка"))]],
         )
     )
 ```
