@@ -164,3 +164,4 @@ cython_debug/
 /*.py
 /uv.lock
 AGENTS.md
+release.ps1
