@@ -1,5 +1,4 @@
-from examples.tictactoe import CloseInput, MoveInput
-from examples.tictactoe_rules import board_text, is_valid_code, winner
+from examples.tictactoe import CloseInput, MoveInput, board_text, is_valid_code, winner
 
 
 def test_winner_detects_rows_columns_and_diagonals() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
@@ -21,7 +22,34 @@ from vkuxt import (
     VKMessagesCallbackAdapter,
 )
 
-from .tictactoe_rules import board_text, is_valid_code, winner
+_CODE_ALPHABET = frozenset("0123456789ABCDEF")
+_WIN_LINES = (
+    (0, 1, 2),
+    (3, 4, 5),
+    (6, 7, 8),
+    (0, 3, 6),
+    (1, 4, 7),
+    (2, 5, 8),
+    (0, 4, 8),
+    (2, 4, 6),
+)
+
+
+def winner(board: Sequence[str | None]) -> int | None:
+    for a, b, c in _WIN_LINES:
+        if board[a] is not None and board[a] == board[b] == board[c]:
+            return 0 if board[a] == "X" else 1
+    return None
+
+
+def board_text(board: Sequence[str | None]) -> str:
+    cells = [value or "·" for value in board]
+    return "\n".join(" | ".join(cells[row : row + 3]) for row in range(0, 9, 3))
+
+
+def is_valid_code(code: str) -> bool:
+    return len(code) == 6 and all(character in _CODE_ALPHABET for character in code)
+
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -111,6 +139,92 @@ class GameState(BaseModel):
     turn: int
     winner: int | None = None
     finish_reason: Literal["line", "draw", "surrender"] | None = None
+
+
+def lobby_key(metadata: VKMessageMetadata, code: str) -> dict[str, int | str]:
+    return {
+        "app": "ttt",
+        "kind": "lobby",
+        "group_id": metadata.group_id,
+        "code": code,
+    }
+
+
+def game_key(metadata: VKMessageMetadata, game_id: str) -> dict[str, int | str]:
+    return {
+        "app": "ttt",
+        "kind": "game",
+        "group_id": metadata.group_id,
+        "game_id": game_id,
+    }
+
+
+def player_at(game: GameState, seat: int) -> Participant | None:
+    if 0 <= seat < len(game.players):
+        return game.players[seat]
+    return None
+
+
+def is_player(
+    player: Participant,
+    metadata: VKMessageMetadata,
+) -> bool:
+    return (
+        player.user_id == metadata.user_id
+        and player.peer_id == metadata.peer_id
+    )
+
+
+def apply_screen_state(
+    state: TicTacToeState,
+    game: GameState,
+    seat: int,
+) -> None:
+    player = game.players[seat]
+    state.uid = player.user_id
+    state.code = ""
+    state.game_id = game.game_id
+    state.seat = seat
+
+
+def new_screen_state(game: GameState, seat: int) -> TicTacToeState:
+    state = TicTacToeState()
+    apply_screen_state(state, game, seat)
+    return state
+
+
+def apply_game_action(
+    game: GameState,
+    data: MoveInput | SurrenderInput,
+    metadata: VKMessageMetadata,
+) -> bool:
+    if game.status != "active":
+        return False
+    player = player_at(game, data.seat)
+    if player is None or not is_player(player, metadata):
+        return False
+    if isinstance(data, MoveInput):
+        if game.turn != data.seat:
+            return False
+        if not 0 <= data.cell < 9 or game.board[data.cell] is not None:
+            return False
+        game.board[data.cell] = "X" if data.seat == 0 else "O"
+        won_seat = winner(game.board)
+        if won_seat is not None:
+            game.status = "finished"
+            game.winner = won_seat
+            game.finish_reason = "line"
+        elif all(game.board):
+            game.status = "finished"
+            game.winner = None
+            game.finish_reason = "draw"
+        else:
+            game.turn = 1 - data.seat
+        return True
+    game.status = "finished"
+    game.winner = 1 - data.seat
+    game.finish_reason = "surrender"
+    return True
 
 
 def menu_view(uid: int) -> VKInterface:
@@ -240,6 +354,26 @@ def game_view(game: GameState, seat: int) -> VKInterface:
     return VKInterface(text=text, kb=rows, ttl=GAME_TTL)
 
 
+async def draw_game(
+    ctx: VKContext,
+    metadata: VKMessageMetadata,
+    game: GameState,
+) -> None:
+    for seat, player in enumerate(game.players):
+        view = game_view(game, seat)
+        if player.peer_id == metadata.peer_id:
+            apply_screen_state(ctx.state, game, seat)
+            await ctx.redraw(view)
+        else:
+            handle = await ctx.adapter.redraw(view, peer_id=player.peer_id)
+            if handle is not None:
+                await ctx.app.set_state(
+                    handle.state_key(),
+                    new_screen_state(game, seat),
+                    ttl=GAME_TTL,
+                )
+
+
 async def menu(
     ctx: VKContext,
     metadata: VKMessageMetadata,
@@ -262,12 +396,7 @@ async def create_lobby(
         return
     for _ in range(8):
         code = secrets.token_hex(3).upper()
-        key = {
-            "app": "ttt",
-            "kind": "lobby",
-            "group_id": metadata.group_id,
-            "code": code,
-        }
+        key = lobby_key(metadata, code)
         async with ctx.app.lock(key):
             if await ctx.app.get_state(key, LobbyState) is not None:
                 continue
@@ -311,21 +440,12 @@ async def join_code(
     if not is_valid_code(code):
         return
 
-    lobby_key = {
-        "app": "ttt",
-        "kind": "lobby",
-        "group_id": metadata.group_id,
-        "code": code,
-    }
+    lobby_state_key = lobby_key(metadata, code)
     game_id = uuid4().hex
-    game_key = {
-        "app": "ttt",
-        "kind": "game",
-        "group_id": metadata.group_id,
-        "game_id": game_id,
-    }
-    async with ctx.app.lock(lobby_key, game_key):
-        lobby = await ctx.app.get_state(lobby_key, LobbyState)
+    game_state_key = game_key(metadata, game_id)
+    # id игры новый, поэтому лочить game_state_key не нужно.
+    async with ctx.app.lock(lobby_state_key):
+        lobby = await ctx.app.get_state(lobby_state_key, LobbyState)
         if lobby is None or lobby.status != "waiting":
             return
         if lobby.owner.user_id == metadata.user_id:
@@ -341,23 +461,10 @@ async def join_code(
             board=[None] * 9,
             turn=secrets.randbelow(2),
         )
-        await ctx.app.delete_state(lobby_key)
-        await ctx.app.set_state(game_key, game, ttl=GAME_TTL)
+        await ctx.app.delete_state(lobby_state_key)
+        await ctx.app.set_state(game_state_key, game, ttl=GAME_TTL)
 
-    for seat, player in enumerate(game.players):
-        screen_state = TicTacToeState(
-            game_id=game.game_id,
-            seat=seat,
-            uid=player.user_id,
-        )
-        view = game_view(game, seat)
-        if player.peer_id == metadata.peer_id:
-            ctx.state = screen_state
-            await ctx.redraw(view)
-        else:
-            handle = await ctx.adapter.redraw(view, peer_id=player.peer_id)
-            if handle is not None:
-                await ctx.app.set_state(handle.state_key(), screen_state, ttl=GAME_TTL)
+    await draw_game(ctx, metadata, game)
 
 
 async def cancel_join(
@@ -382,21 +489,12 @@ async def abandon_lobby(
     code = ctx.state.code
     if not code or code != data.code:
         return
-    key = {
-        "app": "ttt",
-        "kind": "lobby",
-        "group_id": metadata.group_id,
-        "code": code,
-    }
+    key = lobby_key(metadata, code)
     async with ctx.app.lock(key):
         lobby = await ctx.app.get_state(key, LobbyState)
         if lobby is None or lobby.status != "waiting":
             return
-        owner = lobby.owner
-        if (
-            owner.user_id != metadata.user_id
-            or owner.peer_id != metadata.peer_id
-        ):
+        if not is_player(lobby.owner, metadata):
             return
         await ctx.app.delete_state(key)
     await ctx.redraw(None)
@@ -412,70 +510,15 @@ async def game_action(
     seat = ctx.state.seat
     if game_id != data.game_id or seat != data.seat:
         return
-    key = {
-        "app": "ttt",
-        "kind": "game",
-        "group_id": metadata.group_id,
-        "game_id": data.game_id,
-    }
+    key = game_key(metadata, data.game_id)
     async with ctx.app.lock(key):
         game = await ctx.app.get_state(key, GameState)
-        if game is None or game.status != "active":
+        if game is None or not apply_game_action(game, data, metadata):
             return
-        if not 0 <= data.seat < len(game.players):
-            return
-        player = game.players[data.seat]
-        if (
-            player.user_id != metadata.user_id
-            or player.peer_id != metadata.peer_id
-        ):
-            return
-
-        if isinstance(data, MoveInput):
-            if game.turn != data.seat:
-                return
-            if not 0 <= data.cell < 9 or game.board[data.cell] is not None:
-                return
-            game.board[data.cell] = "X" if data.seat == 0 else "O"
-            won_seat = winner(game.board)
-            if won_seat is not None:
-                game.status = "finished"
-                game.winner = won_seat
-                game.finish_reason = "line"
-            elif all(game.board):
-                game.status = "finished"
-                game.winner = None
-                game.finish_reason = "draw"
-            else:
-                game.turn = 1 - data.seat
-        else:
-            game.status = "finished"
-            game.winner = 1 - data.seat
-            game.finish_reason = "surrender"
         await ctx.app.set_state(key, game, ttl=GAME_TTL)
 
         # Рендер под тем же lock'ом сохраняет порядок досок.
-        for render_seat, render_player in enumerate(game.players):
-            screen_state = TicTacToeState(
-                game_id=game.game_id,
-                seat=render_seat,
-                uid=render_player.user_id,
-            )
-            view = game_view(game, render_seat)
-            if render_player.peer_id == metadata.peer_id:
-                ctx.state = screen_state
-                await ctx.redraw(view)
-            else:
-                handle = await ctx.adapter.redraw(
-                    view,
-                    peer_id=render_player.peer_id,
-                )
-                if handle is not None:
-                    await ctx.app.set_state(
-                        handle.state_key(),
-                        screen_state,
-                        ttl=GAME_TTL,
-                    )
+        await draw_game(ctx, metadata, game)
 
 
 async def back_to_menu(
@@ -486,22 +529,12 @@ async def back_to_menu(
 ) -> None:
     if ctx.state.game_id != data.game_id or ctx.state.seat != data.seat:
         return
-    key = {
-        "app": "ttt",
-        "kind": "game",
-        "group_id": metadata.group_id,
-        "game_id": data.game_id,
-    }
+    key = game_key(metadata, data.game_id)
     game = await ctx.app.get_state(key, GameState)
     if game is None or game.status != "finished":
         return
-    if not 0 <= data.seat < len(game.players):
-        return
-    player = game.players[data.seat]
-    if (
-        player.user_id != metadata.user_id
-        or player.peer_id != metadata.peer_id
-    ):
+    player = player_at(game, data.seat)
+    if player is None or not is_player(player, metadata):
         return
     ctx.state = TicTacToeState(uid=metadata.user_id)
     await ctx.redraw(menu_view(metadata.user_id))
