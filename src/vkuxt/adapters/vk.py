@@ -38,6 +38,7 @@ _PEER_INTERFACE_LIMIT = 10
 _VK_TEXT_LIMIT = 4096
 _VK_INLINE_ROWS_LIMIT = 6
 _VK_ROW_BUTTONS_LIMIT = 5
+_VK_BUTTON_LABEL_LIMIT = 40
 _VK_PAYLOAD_LIMIT = 255
 _VK_BUTTON_COLORS = frozenset(
     {
@@ -118,6 +119,7 @@ class VKInterface(Interface[KeyboardButton]):
                         f"Недопустимый цвет кнопки VK: {color!r}; допустимо: "
                         f"{', '.join(sorted(_VK_BUTTON_COLORS))}"
                     )
+                _validate_button_limits(button)
 
     @property
     def keyboard(self) -> Keyboard:
@@ -149,7 +151,10 @@ class VKInterface(Interface[KeyboardButton]):
                 f"Недопустимый цвет кнопки VK: {color!r}; допустимо: "
                 f"{', '.join(sorted(_VK_BUTTON_COLORS))}"
             )
-        return Button.callback(label, payload=data, color=color)
+        _validate_button_label(label)
+        button = Button.callback(label, payload=data, color=color)
+        _validate_button_payload(button)
+        return button
 
 
 @dataclass(slots=True)
@@ -174,6 +179,7 @@ class _VKAdapterBase(Adapter, ABC):
     """Общее состояние VK-адаптеров: группа, peer-lock и контекст события."""
 
     interface_type: ClassVar[type[Interface[Any]]] = VKInterface
+    platform: ClassVar[str] = "vk"
 
     def __init__(self, app: App, group_id: int) -> None:
         Adapter.__init__(self, app)
@@ -202,10 +208,18 @@ class _VKAdapterBase(Adapter, ABC):
         self,
         interface_id: VKMessageInterfaceId,
     ) -> VKMessageInterface:
-        record = await self.app._get_interface_record(interface_id)
+        record = await self.app._get_interface_record(
+            interface_id,
+            platform=self.platform,
+        )
         if record is None:
-            return VKMessageInterface(interface_id)
-        return VKMessageInterface(interface_id, dict(record.actions), record.ttl)
+            return VKMessageInterface(interface_id, platform=self.platform)
+        return VKMessageInterface(
+            interface_id,
+            dict(record.actions),
+            record.ttl,
+            platform=self.platform,
+        )
 
     async def latest_interface(self, peer_id: int) -> VKMessageInterface | None:
         """Получить Python-объект последнего интерфейса в диалоге ``peer_id``."""
@@ -255,16 +269,32 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
     async def delete(self, interface: VKMessageInterface) -> bool:
         if not isinstance(interface.id, VKMessageInterfaceId):
             raise TypeError("VK-адаптер ожидает InterfaceHandle с VKMessageInterfaceId")
+        interface.platform = self.platform
+        if interface.deleted:
+            await self.app._remove_interface_record(
+                interface.id,
+                platform=self.platform,
+            )
+            await self.app.delete_state(interface.state_key())
+            await self._forget_interface(interface.id)
+            return True
         response = await self.vk.messages.delete(
             cmids=[interface.id.cmid],
             peer_id=interface.id.peer_id,
             group_id=interface.id.group_id,
             delete_for_all=True,
         )
-        await self.app._remove_interface_record(interface.id)
+        if not _delete_succeeded(response):
+            return False
+        interface.deleted = True
+        await self.app._remove_interface_record(
+            interface.id,
+            platform=self.platform,
+        )
+        await self.app.delete_state(interface.state_key())
         await self._forget_interface(interface.id)
         self._mark_current_interface(interface.id)
-        return bool(response)
+        return True
 
     async def redraw(
         self,
@@ -312,8 +342,8 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             current = context.interface
 
         if view is None:
-            if current is not None:
-                await self.delete(current)
+            if current is not None and not await self.delete(current):
+                raise RuntimeError("Не удалось удалить VK-интерфейс")
             return None
 
         if (
@@ -379,17 +409,13 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         if not isinstance(payload, str):
             return button
         payload_size = len(payload.encode("utf-8"))
-        if not self.app.tokenize_long_input or payload_size <= _VK_PAYLOAD_LIMIT:
+        if payload_size <= _VK_PAYLOAD_LIMIT:
             return button
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError as exc:
+        data = _long_payload_data(payload)
+        if not self.app.tokenize_long_input:
             raise ValueError(
-                "payload кнопки VK длиннее 255 байт и не является JSON-объектом"
-            ) from exc
-        if not isinstance(data, dict):
-            raise ValueError(
-                "payload кнопки VK длиннее 255 байт и не является JSON-объектом"
+                f"payload кнопки VK больше {_VK_PAYLOAD_LIMIT} байт; "
+                "включите tokenize_long_input"
             )
         token = secrets.token_urlsafe(6)
         while token in actions:
@@ -427,9 +453,19 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             peer_id=peer_id,
             group_id=self.group_id,
         )
-        ttl = await self.app._register_interface(interface_id, prepared.actions, view.ttl)
+        ttl = await self.app._register_interface(
+            interface_id,
+            prepared.actions,
+            view.ttl,
+            platform=self.platform,
+        )
         await self._remember_interface(interface_id, ttl)
-        return VKMessageInterface(interface_id, prepared.actions, ttl)
+        return VKMessageInterface(
+            interface_id,
+            prepared.actions,
+            ttl,
+            platform=self.platform,
+        )
 
     async def _edit_prepared(
         self,
@@ -448,8 +484,15 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         if not changed:
             return None
         self._mark_current_interface(interface.id)
-        ttl = await self.app._register_interface(interface.id, prepared.actions, view.ttl)
+        ttl = await self.app._register_interface(
+            interface.id,
+            prepared.actions,
+            view.ttl,
+            platform=self.platform,
+        )
         await self._remember_interface(interface.id, ttl)
+        interface.platform = self.platform
+        interface.deleted = False
         interface.actions = prepared.actions
         interface.ttl = ttl
         return interface
@@ -470,7 +513,13 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             active = []
             for item in interfaces:
                 previous_id = _decode_interface_id(item)
-                if await self.app._get_interface_record(previous_id) is not None:
+                if previous_id is not None and (
+                    await self.app._get_interface_record(
+                        previous_id,
+                        platform=self.platform,
+                    )
+                    is not None
+                ):
                     active.append(encode_key(previous_id))
             active = [item for item in active if item != encoded]
             active.append(encoded)
@@ -481,24 +530,26 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         index_key = _peer_index_key(interface_id.group_id, interface_id.peer_id)
         async with self._peer_lock:
             raw = await self.app.storage.get(index_key)
-            if raw is not None:
-                interfaces = []
-                for item in _load_index(raw):
-                    previous_id = _decode_interface_id(item)
-                    if previous_id != interface_id:
-                        interfaces.append(encode_key(previous_id))
-                if interfaces:
-                    interfaces = interfaces[-_PEER_INTERFACE_LIMIT:]
-                    record = await self.app._get_interface_record(
-                        _decode_interface_id(interfaces[-1])
-                    )
-                    await self.app.storage.set(
-                        index_key,
-                        _json(interfaces),
-                        ttl=record.ttl if record is not None else None,
-                    )
-                else:
-                    await self.app.storage.delete(index_key)
+            if raw is None:
+                return
+            remaining: list[VKMessageInterfaceId] = []
+            for item in _load_index(raw):
+                previous_id = _decode_interface_id(item)
+                if previous_id is not None and previous_id != interface_id:
+                    remaining.append(previous_id)
+            remaining = remaining[-_PEER_INTERFACE_LIMIT:]
+            if remaining:
+                record = await self.app._get_interface_record(
+                    remaining[-1],
+                    platform=self.platform,
+                )
+                await self.app.storage.set(
+                    index_key,
+                    _json([encode_key(item) for item in remaining]),
+                    ttl=record.ttl if record is not None else None,
+                )
+            else:
+                await self.app.storage.delete(index_key)
 
     async def _latest_interface(self, peer_id: int) -> VKMessageInterfaceId | None:
         index_key = _peer_index_key(self.group_id, peer_id)
@@ -507,17 +558,23 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             if raw is None:
                 return None
             interfaces = _load_index(raw)
-            live: list[str] = []
+            live_ids: list[VKMessageInterfaceId] = []
             latest = None
             latest_ttl = None
             for encoded in interfaces:
                 interface_id = _decode_interface_id(encoded)
-                record = await self.app._get_interface_record(interface_id)
+                if interface_id is None:
+                    continue
+                record = await self.app._get_interface_record(
+                    interface_id,
+                    platform=self.platform,
+                )
                 if record is not None:
-                    live.append(encode_key(interface_id))
+                    live_ids.append(interface_id)
                     latest = interface_id
                     latest_ttl = record.ttl
-            live = live[-_PEER_INTERFACE_LIMIT:]
+            live_ids = live_ids[-_PEER_INTERFACE_LIMIT:]
+            live = [encode_key(item) for item in live_ids]
             if live:
                 if live != interfaces:
                     await self.app.storage.set(index_key, _json(live), ttl=latest_ttl)
@@ -578,7 +635,11 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
         # vkx дедуплицирует конвертный event_id и повторный message_new по
         # peer_id + conversation_message_id; object.event_id у message_event
         # в vkx 0.1.12 пока не учитывается.
-        event = self.callback_server.handle(callback_raw)
+        try:
+            event = self.callback_server.handle(callback_raw)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Не удалось разобрать callback-событие: %s", exc)
+            return None
         if event is None:
             confirmation_code = self.confirmation_code or getattr(
                 self.callback_server,
@@ -588,8 +649,15 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
             if confirmation_code:
                 from vkx.server import parse_callback
 
-                candidate = parse_callback(callback_raw)
-                if _event_type(candidate) == "confirmation" and candidate.group_id == self.group_id:
+                try:
+                    candidate = parse_callback(callback_raw)
+                except (TypeError, ValueError) as exc:
+                    logger.warning("Не удалось разобрать callback-событие: %s", exc)
+                    return None
+                if (
+                    _event_type(candidate) == "confirmation"
+                    and candidate.group_id == self.group_id
+                ):
                     return Input(_VKConfirmationMetadata(group_id=self.group_id))
             return None
         event_type = _event_type(event)
@@ -599,10 +667,14 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
             return Input(_VKConfirmationMetadata(group_id=self.group_id))
         if event.group_id != self.group_id:
             return None
-        if event_type == "message_event":
-            return await self._parse_message_event(event)
-        if event_type == "message_new":
-            return await self._parse_message_new(event)
+        try:
+            if event_type == "message_event":
+                return await self._parse_message_event(event)
+            if event_type == "message_new":
+                return await self._parse_message_new(event)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("Некорректное callback-событие %s: %s", event_type, exc)
+            return None
         return None
 
     async def _parse_message_event(self, event: Any) -> Input | None:
@@ -614,12 +686,11 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
         event_id = obj.event_id
         if peer_id is None or user_id is None or event_id is None:
             return None
-        if getattr(event, "event_id", None) is None:
-            is_duplicate = getattr(self.callback_server, "is_duplicate", None)
-            # Отдельный префикс не конфликтует с будущей нативной
-            # дедупликацией вложенного event_id в vkx.
-            if callable(is_duplicate) and is_duplicate(f"vkuxt:{event_id}"):
-                return None
+        is_duplicate = getattr(self.callback_server, "is_duplicate", None)
+        # Отдельный префикс не конфликтует с нативной дедупликацией
+        # конвертного event_id в vkx.
+        if callable(is_duplicate) and is_duplicate(f"vkuxt:{event_id}"):
+            return None
 
         interface_id = (
             VKMessageInterfaceId(
@@ -724,7 +795,13 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
                 peer_id=metadata.peer_id,
                 group_id=metadata.group_id,
             )
-            if await self.app._get_interface_record(candidate) is not None:
+            if (
+                await self.app._get_interface_record(
+                    candidate,
+                    platform=self.platform,
+                )
+                is not None
+            ):
                 interface = await self._handle(candidate)
         elif self.dm_latest_interface and metadata.peer_id == metadata.user_id:
             interface = await self.latest_interface(metadata.peer_id)
@@ -814,6 +891,62 @@ class VKMessagesCallbackAdapter(VKCallbackAdapter, VKMessagesAdapter):
         )
 
 
+def _validate_button_limits(button: KeyboardButton) -> None:
+    label = getattr(button.action, "label", None)
+    if isinstance(label, str):
+        _validate_button_label(label)
+    _validate_button_payload(button)
+
+
+def _validate_button_label(label: str) -> None:
+    if len(label) > _VK_BUTTON_LABEL_LIMIT:
+        raise ValueError(
+            f"label кнопки VK не должен превышать {_VK_BUTTON_LABEL_LIMIT} символов"
+        )
+
+
+def _validate_button_payload(button: KeyboardButton) -> None:
+    payload = getattr(button.action, "payload", None)
+    if isinstance(payload, str) and len(payload.encode("utf-8")) > _VK_PAYLOAD_LIMIT:
+        _long_payload_data(payload)
+
+
+def _long_payload_data(payload: str) -> dict[str, Any]:
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"payload кнопки VK длиннее {_VK_PAYLOAD_LIMIT} байт "
+            "и не является JSON-объектом"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"payload кнопки VK длиннее {_VK_PAYLOAD_LIMIT} байт "
+            "и не является JSON-объектом"
+        )
+    return data
+
+
+def _delete_succeeded(response: Any) -> bool:
+    if isinstance(response, bool):
+        return response
+    if isinstance(response, Mapping):
+        return bool(response.get("response"))
+    if isinstance(response, (list, tuple)):
+        return bool(response) and all(_delete_item_succeeded(item) for item in response)
+    return _delete_item_succeeded(response)
+
+
+def _delete_item_succeeded(item: Any) -> bool:
+    if isinstance(item, bool):
+        return item
+    if isinstance(item, Mapping):
+        return bool(item.get("response"))
+    if hasattr(item, "response"):
+        return bool(item.response)
+    return bool(item)
+
+
 def _event_type(event: Any) -> str:
     value = event.type
     return str(getattr(value, "value", value))
@@ -846,15 +979,21 @@ def _load_index(raw: str | None) -> list[str]:
         return []
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.warning("Повреждённый индекс интерфейсов VK: %s", exc)
         return []
     if not isinstance(data, list):
+        logger.warning("Индекс интерфейсов VK должен быть списком")
         return []
     return [item for item in data if isinstance(item, str)]
 
 
-def _decode_interface_id(encoded: str) -> VKMessageInterfaceId:
-    return decode_key(encoded, VKMessageInterfaceId)
+def _decode_interface_id(encoded: str) -> VKMessageInterfaceId | None:
+    try:
+        return decode_key(encoded, VKMessageInterfaceId)
+    except (TypeError, ValueError) as exc:
+        logger.warning("Пропускаю повреждённую запись индекса интерфейсов VK: %s", exc)
+        return None
 
 
 def _json(value: Any) -> str:

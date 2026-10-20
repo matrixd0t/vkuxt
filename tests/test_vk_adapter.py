@@ -99,7 +99,13 @@ def test_send_registers_the_vk_external_mount_id() -> None:
             peer_id=2000000001,
             group_id=71,
         )
-        assert await app._get_interface_record(interface.id) is not None
+        assert (
+            await app._get_interface_record(
+                interface.id,
+                platform=adapter.platform,
+            )
+            is not None
+        )
         assert vk.messages.sent[0]["peer_ids"] == [interface.id.peer_id]
         await app.close()
 
@@ -454,14 +460,14 @@ def test_only_oversized_button_payloads_are_tokenized() -> None:
         disabled = App(tokenize_long_input=False)
         disabled_vk = FakeVK()
         disabled_adapter = add_vk_adapter(disabled, disabled_vk)
-        disabled_interface = await disabled_adapter.send(
-            5,
-            VKInterface(
-                text="hello",
-                kb=[[VKInterface.callback("long", long)]],
-            ),
-        )
-        assert disabled_interface.actions == {}
+        with pytest.raises(ValueError, match="tokenize_long_input"):
+            await disabled_adapter.send(
+                5,
+                VKInterface(
+                    text="hello",
+                    kb=[[VKInterface.callback("long", long)]],
+                ),
+            )
         await disabled.close()
         await app.close()
 
@@ -647,10 +653,17 @@ def test_redraw_replies_to_text_and_replaces_replied_interface() -> None:
         assert sent["keyboard"] is None
         assert sent["reply_to"] == 44
         assert vk.messages.deletions[-1]["cmids"] == [old.id.cmid]
-        assert await app._get_interface_record(old.id) is None
         assert (
             await app._get_interface_record(
-                VKMessageInterfaceId(cmid=92, peer_id=5, group_id=71)
+                old.id,
+                platform=adapter.platform,
+            )
+            is None
+        )
+        assert (
+            await app._get_interface_record(
+                VKMessageInterfaceId(cmid=92, peer_id=5, group_id=71),
+                platform=adapter.platform,
             )
             is not None
         )
@@ -714,7 +727,13 @@ def test_redraw_targets_a_concrete_interface_and_returns_handle() -> None:
         assert vk.messages.edits[-1]["cmid"] == second.id.cmid
         assert vk.messages.edits[-1]["message"] == "updated second"
         assert vk.messages.deletions == []
-        assert (await app._get_interface_record(first.id)) is not None
+        assert (
+            await app._get_interface_record(
+                first.id,
+                platform=adapter.platform,
+            )
+            is not None
+        )
         await app.close()
 
     asyncio.run(scenario())

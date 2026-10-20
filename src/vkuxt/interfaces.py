@@ -60,13 +60,23 @@ class InterfaceHandle[IdT: KeyLike]:
     id: IdT
     actions: dict[str, dict[str, Any]] = field(default_factory=dict)
     ttl: float | None = None
+    platform: str = ""
+    deleted: bool = False
+    """Установлен адаптером после успешного удаления интерфейса."""
 
     def state_key(self) -> dict[str, Any]:
         """Стабильный ключ для ``App.get_state``/``set_state``.
 
-        Зависит только от ``id`` и не меняется при перерисовках. Сам handle
-        ключом не является: ``actions`` и ``ttl`` обновляются адаптером.
+        Зависит от ``id`` и ``platform`` и не меняется при перерисовках. Сам
+        handle ключом не является: ``actions`` и ``ttl`` обновляются адаптером.
         """
+        if self.platform:
+            return {
+                "interface": {
+                    "platform": self.platform,
+                    "id": encode_key(self.id),
+                }
+            }
         return {"interface": encode_key(self.id)}
 
 
@@ -83,6 +93,13 @@ class InterfaceRecord:
         actions = data.get("actions", {})
         if not isinstance(actions, dict):
             raise ValueError("Поле actions интерфейса должно быть объектом")
+        for token, action in actions.items():
+            if not isinstance(token, str):
+                raise ValueError("Ключи actions интерфейса должны быть строками")
+            if not isinstance(action, dict):
+                raise ValueError("Значения actions интерфейса должны быть объектами")
+            if "data" not in action:
+                raise ValueError("Значение actions интерфейса должно содержать data")
         ttl = data.get("ttl")
         if ttl is not None and (not isinstance(ttl, (int, float)) or ttl <= 0):
             raise ValueError("TTL интерфейса должен быть положительным числом или None")

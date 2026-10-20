@@ -81,6 +81,8 @@ class Input[DataT, MetadataT: BaseMetadata]:
 
 class Adapter:
     interface_type: ClassVar[type[Interface[Any]]] = Interface
+    platform: ClassVar[str] = ""
+    """Имя платформы; входит в ключи интерфейсов и связанного состояния."""
 
     def __init__(self, app: App) -> None:
         self.app = app
@@ -88,7 +90,7 @@ class Adapter:
     def context_key(self, metadata: BaseMetadata) -> KeyLike:
         """Ключ состояния контекста, не привязанного к интерфейсу."""
         return {
-            "adapter": f"{type(self).__module__}.{type(self).__qualname__}",
+            "adapter": self.platform or f"{type(self).__module__}.{type(self).__qualname__}",
             "metadata": encode_key(metadata),
         }
 
@@ -147,6 +149,7 @@ class Context[
     state: StateT
     _state_key: KeyLike | None
     _state_ttl: TTLValue = DEFAULT_TTL
+    _state_cache: dict[str, dict[str, Any] | None] | None = None
 
     async def redraw(
         self,
@@ -158,8 +161,9 @@ class Context[
         result = await self.adapter.redraw(interface, target=previous)
         self.interface = result
         if result is None:
-            if previous is not None and previous_key is not None:
+            if previous_key is not None:
                 await self.app.delete_state(previous_key)
+                self._forget_cached_state(previous_key)
                 self._state_key = None
                 self._state_ttl = DEFAULT_TTL
             return None
@@ -167,22 +171,47 @@ class Context[
         new_key = result.state_key()
         if new_key != previous_key:
             await self.app.set_state(new_key, self.state, ttl=result.ttl)
+            self._remember_cached_state(new_key)
             if previous_key is not None and (
                 previous is None
-                or await self.app._get_interface_record(previous.id) is None
+                or await self.app._get_interface_record(
+                    previous.id,
+                    platform=previous.platform,
+                )
+                is None
             ):
                 await self.app.delete_state(previous_key)
+                self._forget_cached_state(previous_key)
             self._state_key = new_key
         self._state_ttl = result.ttl
         return result
 
     async def _save(self) -> None:
-        if self._state_key is not None:
-            await self.app.set_state(self._state_key, self.state, ttl=self._state_ttl)
+        if self._state_key is None:
+            return
+        if self.interface is not None and self.interface.deleted:
+            self._forget_cached_state(self._state_key)
+            return
+        await self.app.set_state(self._state_key, self.state, ttl=self._state_ttl)
+        self._remember_cached_state(self._state_key)
+
+    def _remember_cached_state(self, state_key: KeyLike) -> None:
+        if self._state_cache is not None:
+            state = (
+                self.state.model_dump(mode="json")
+                if isinstance(self.state, BaseModel)
+                else self.state
+            )
+            self._state_cache[encode_key(state_key)] = state
+
+    def _forget_cached_state(self, state_key: KeyLike) -> None:
+        if self._state_cache is not None:
+            self._state_cache.pop(encode_key(state_key), None)
 
 
 @dataclass(frozen=True, slots=True)
 class _HandlerEntry:
+    order: int
     background: bool
     function: Handler
     metadata_types: tuple[type[BaseMetadata], ...]
@@ -204,18 +233,23 @@ class App:
         planner: Planner | None = None,
         tokenize_long_input: bool = True,
         close_timeout: float | None = 10.0,
+        adapter_close_timeout: float | None = 10.0,
     ) -> None:
         if ttl is not None and ttl <= 0:
             raise ValueError("ttl должен быть больше нуля или None")
         if close_timeout is not None and close_timeout <= 0:
             raise ValueError("close_timeout должен быть больше нуля или None")
+        if adapter_close_timeout is not None and adapter_close_timeout <= 0:
+            raise ValueError("adapter_close_timeout должен быть больше нуля или None")
         self.storage = storage if storage is not None else MemoryStorage()
         self.ttl = ttl
         self.tokenize_long_input = tokenize_long_input
         self.close_timeout = close_timeout
+        self.adapter_close_timeout = adapter_close_timeout
         self.planner = planner if planner is not None else Planner()
         self._owns_planner = planner is None
         self._handlers: list[_HandlerEntry] = []
+        self._handlers_by_metadata: dict[type[BaseMetadata], list[_HandlerEntry]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._locks = KeyedLockPool()
         # Свободный контейнер для сервисов приложения; vkuxt его не использует.
@@ -281,6 +315,7 @@ class App:
             state_type,
         ) = _handler_annotations(function, localns)
         entry = _HandlerEntry(
+            order=len(self._handlers),
             background=background,
             function=function,
             metadata_types=metadata_types,
@@ -289,6 +324,8 @@ class App:
             state_type=state_type,
         )
         self._handlers.append(entry)
+        for metadata_type in metadata_types:
+            self._handlers_by_metadata.setdefault(metadata_type, []).append(entry)
         return function
 
     @overload
@@ -308,13 +345,20 @@ class App:
         entries = self._matching_handlers(_input.metadata)
         payload = _input.data.model_dump(mode="python") if _input.data is not None else None
         cache: dict[type[InputData], InputData | None] = {}
+        state_cache: dict[str, dict[str, Any] | None] = {}
         for entry in entries:
             if not entry.background:
                 matched, data = self._data_for_handler(entry, payload, cache)
                 if not matched:
                     continue
                 try:
-                    result = await self._invoke(entry, adapter, _input, data)
+                    result = await self._invoke(
+                        entry,
+                        adapter,
+                        _input,
+                        data,
+                        state_cache,
+                    )
                 except StopHandlerChain:
                     break
                 if result is not None:
@@ -341,18 +385,24 @@ class App:
         adapter: Adapter,
         event: Input,
     ) -> None:
+        state_cache: dict[str, dict[str, Any] | None] = {}
         for entry, data in entries:
             try:
-                await self._invoke(entry, adapter, event, data)
+                await self._invoke(entry, adapter, event, data, state_cache)
             except StopHandlerChain:
                 return
+            except Exception:
+                logger.exception(
+                    "Фоновый хендлер %r завершился с ошибкой",
+                    entry.function,
+                )
 
     def _matching_handlers(self, metadata: BaseMetadata) -> tuple[_HandlerEntry, ...]:
-        return tuple(
-            entry
-            for entry in self._handlers
-            if isinstance(metadata, entry.metadata_types)
-        )
+        matched: dict[int, _HandlerEntry] = {}
+        for metadata_type in type(metadata).__mro__:
+            for entry in self._handlers_by_metadata.get(metadata_type, ()):
+                matched[entry.order] = entry
+        return tuple(matched[order] for order in sorted(matched))
 
     @staticmethod
     def _data_for_handler(
@@ -398,8 +448,13 @@ class App:
             self._started_adapters.append(adapter)
 
     async def _wait_for_adapter_starts(self) -> None:
-        while self._adapter_start_tasks:
-            tasks = tuple(self._adapter_start_tasks)
+        current = asyncio.current_task()
+        while True:
+            tasks = tuple(
+                task for task in self._adapter_start_tasks if task is not current
+            )
+            if not tasks:
+                return
             await asyncio.gather(*tasks, return_exceptions=True)
             self._adapter_start_tasks.difference_update(tasks)
 
@@ -409,8 +464,13 @@ class App:
 
     async def wait_background(self) -> None:
         """Дождаться завершения всех запущенных фоновых хендлеров."""
-        while self._background_tasks:
-            tasks = tuple(self._background_tasks)
+        current = asyncio.current_task()
+        while True:
+            tasks = tuple(
+                task for task in self._background_tasks if task is not current
+            )
+            if not tasks:
+                return
             await asyncio.gather(*tasks, return_exceptions=True)
             self._background_tasks.difference_update(tasks)
 
@@ -419,6 +479,7 @@ class App:
         adapter: Adapter,
         event: Input,
         state_type: type[StateNamespace],
+        state_cache: dict[str, dict[str, Any] | None] | None = None,
     ) -> Context[Any, Any]:
         interface = event.interface
         if interface is not None:
@@ -427,9 +488,15 @@ class App:
         else:
             state_key = adapter.context_key(event.metadata)
             state_ttl = self.ttl
-        raw_state = await self.get_state(state_key)
-        if raw_state is not None and not isinstance(raw_state, dict):
-            raise TypeError("Состояние контекста должно быть JSON-объектом")
+        cache_key = encode_key(state_key)
+        if state_cache is not None and cache_key in state_cache:
+            raw_state = state_cache[cache_key]
+        else:
+            raw_state = await self.get_state(state_key)
+            if raw_state is not None and not isinstance(raw_state, dict):
+                raise TypeError("Состояние контекста должно быть JSON-объектом")
+            if state_cache is not None:
+                state_cache[cache_key] = raw_state
         if raw_state is None:
             try:
                 state = state_type()
@@ -453,6 +520,7 @@ class App:
             state=state,
             _state_key=state_key,
             _state_ttl=state_ttl,
+            _state_cache=state_cache,
         )
 
     async def _invoke(
@@ -461,8 +529,14 @@ class App:
         adapter: Adapter,
         event: Input,
         data: InputData | None,
+        state_cache: dict[str, dict[str, Any] | None] | None = None,
     ) -> Any:
-        context = await self._context_for(adapter, event, entry.state_type)
+        context = await self._context_for(
+            adapter,
+            event,
+            entry.state_type,
+            state_cache,
+        )
         try:
             result = entry.function(
                 context,
@@ -491,13 +565,12 @@ class App:
         external_id: KeyLike,
         actions: dict[str, dict[str, Any]],
         ttl: TTLValue,
+        *,
+        platform: str = "",
     ) -> float | None:
-        interface_key = storage_key("interface", external_id)
-        old_record = (
-            InterfaceRecord.from_json_data(json.loads(raw))
-            if (raw := await self.storage.get(interface_key)) is not None
-            else None
-        )
+        interface_key = self._interface_key(external_id, platform)
+        raw = await self.storage.get(interface_key)
+        old_record = self._parse_interface_record(raw) if raw is not None else None
         default_ttl = old_record.ttl if old_record is not None else self.ttl
         lifetime = default_ttl if isinstance(ttl, _DefaultTTL) else ttl
         if lifetime is not None and lifetime <= 0:
@@ -506,12 +579,39 @@ class App:
         await self.storage.set(interface_key, _json(record.to_json_data()), ttl=lifetime)
         return lifetime
 
-    async def _get_interface_record(self, external_id: KeyLike) -> InterfaceRecord | None:
-        raw = await self.storage.get(storage_key("interface", external_id))
-        return InterfaceRecord.from_json_data(json.loads(raw)) if raw is not None else None
+    async def _get_interface_record(
+        self,
+        external_id: KeyLike,
+        *,
+        platform: str = "",
+    ) -> InterfaceRecord | None:
+        raw = await self.storage.get(self._interface_key(external_id, platform))
+        return self._parse_interface_record(raw) if raw is not None else None
 
-    async def _remove_interface_record(self, external_id: KeyLike) -> None:
-        await self.storage.delete(storage_key("interface", external_id))
+    async def _remove_interface_record(
+        self,
+        external_id: KeyLike,
+        *,
+        platform: str = "",
+    ) -> None:
+        await self.storage.delete(self._interface_key(external_id, platform))
+
+    @staticmethod
+    def _interface_key(external_id: KeyLike, platform: str) -> str:
+        if platform:
+            return storage_key(
+                "interface",
+                {"platform": platform, "id": encode_key(external_id)},
+            )
+        return storage_key("interface", external_id)
+
+    @staticmethod
+    def _parse_interface_record(raw: str) -> InterfaceRecord | None:
+        try:
+            return InterfaceRecord.from_json_data(json.loads(raw))
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning("Повреждённая запись интерфейса: %s", exc)
+            return None
 
     @overload
     async def get_state(self, key: KeyLike, model: None = None) -> Any | None: ...
@@ -560,6 +660,10 @@ class App:
                 raise RuntimeError("Нельзя запустить приложение во время остановки")
             if self._running:
                 return
+            if self._started_adapters:
+                raise RuntimeError(
+                    "Предыдущее закрытие не завершено; повторите close()"
+                )
             adapters = tuple(self._adapters)
             self._running = True
             self._closed = False
@@ -618,7 +722,7 @@ class App:
             finally:
                 self._running = False
                 self._closing = False
-                self._closed = True
+                self._closed = not self._started_adapters
                 self._close_owner = None
 
     async def _drain_background_tasks(self) -> None:
@@ -636,15 +740,22 @@ class App:
 
     async def _stop_adapters(self) -> None:
         shutdown_error: BaseException | None = None
-        while self._started_adapters:
-            adapter = self._started_adapters.pop()
+        for adapter in tuple(reversed(self._started_adapters)):
             try:
-                await adapter.close()
+                if self.adapter_close_timeout is None:
+                    await adapter.close()
+                else:
+                    await asyncio.wait_for(
+                        adapter.close(),
+                        timeout=self.adapter_close_timeout,
+                    )
             except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
                 if shutdown_error is None:
                     shutdown_error = exc
                 else:
                     shutdown_error.add_note(f"Ошибка остановки другого адаптера: {exc!r}")
+            else:
+                self._started_adapters.remove(adapter)
         if shutdown_error is not None:
             raise shutdown_error
 

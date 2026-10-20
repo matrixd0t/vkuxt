@@ -87,19 +87,19 @@ class JSONFileStorage(StateStorage):
             item = self._items.get(key)
             if item is not None and _expired(item):
                 self._items.pop(key, None)
-                await asyncio.to_thread(self._write_file)
+                await self._write_file_async()
                 return None
             return item.value if item is not None else None
 
     async def set(self, key: str, value: str, *, ttl: float | None = None) -> None:
         async with self._lock:
             self._items[key] = _Item(value, _expiration(ttl))
-            await asyncio.to_thread(self._write_file)
+            await self._write_file_async()
 
     async def delete(self, key: str) -> None:
         async with self._lock:
             if self._items.pop(key, None) is not None:
-                await asyncio.to_thread(self._write_file)
+                await self._write_file_async()
 
     async def cleanup_expired(self) -> None:
         async with self._lock:
@@ -115,7 +115,17 @@ class JSONFileStorage(StateStorage):
         if expired:
             for key in expired:
                 del self._items[key]
-            await asyncio.to_thread(self._write_file)
+            await self._write_file_async()
+
+    async def _write_file_async(self) -> None:
+        task = asyncio.create_task(asyncio.to_thread(self._write_file))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Отмена не должна оставлять запись в фоне: иначе следующий
+            # set() может писать тот же временный файл одновременно.
+            await asyncio.gather(task, return_exceptions=True)
+            raise
 
     def _read_file(self) -> None:
         if not self.path.exists():
