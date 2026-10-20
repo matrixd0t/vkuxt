@@ -493,7 +493,7 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             else None
         )
         response = await self.vk.messages.send(
-            peer_ids=[peer_id],
+            peer_id=peer_id,
             random_id=secrets.randbelow(2**31),
             group_id=self.group_id,
             message=view.text,
@@ -503,7 +503,7 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         )
         try:
             item = response[0][0]
-            cmid = int(_field(item, "conversation_message_id"))
+            cmid = int(_field(item, "cmid"))
         except (IndexError, KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 "VK не вернул conversation_message_id для отправленного сообщения"
