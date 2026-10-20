@@ -61,7 +61,7 @@ class FakeMessages:
     async def send(self, **kwargs) -> list[list[dict[str, int]]]:
         self.sent.append(kwargs)
         cmid = 90 + len(self.sent)
-        return [[{"conversation_message_id": cmid}]]
+        return [[{"cmid": cmid}]]
 
     async def send_message_event_answer(self, **kwargs) -> None:
         self.answers.append(kwargs)
@@ -108,7 +108,8 @@ def test_send_registers_the_vk_external_mount_id() -> None:
             )
             is not None
         )
-        assert vk.messages.sent[0]["peer_ids"] == [interface.id.peer_id]
+        assert vk.messages.sent[0]["peer_id"] == interface.id.peer_id
+        assert "peer_ids" not in vk.messages.sent[0]
         await app.close()
 
     asyncio.run(scenario())
