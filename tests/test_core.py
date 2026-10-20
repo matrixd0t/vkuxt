@@ -1049,3 +1049,226 @@ def test_context_redraw_none_deletes_interface_state() -> None:
         await app.close()
 
     asyncio.run(scenario())
+
+
+def test_state_typed_handlers_dispatch_workflow_steps() -> None:
+    class AskNameState(StateNamespace):
+        step: Literal["ask_name"] = "ask_name"
+
+    class AskAgeState(StateNamespace):
+        step: Literal["ask_age"] = "ask_age"
+        name: str
+
+    class DoneState(StateNamespace):
+        step: Literal["done"] = "done"
+        name: str
+        age: int
+
+    async def scenario() -> None:
+        app = App()
+        adapter = app.add_adapter(Adapter(app))
+        metadata = EchoMetadata(user_id=10)
+        events: list[str] = []
+
+        @app.handler(background=False)
+        async def start_wizard(
+            ctx: Context[Adapter, None],
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            if text != "start":
+                return
+            events.append("start")
+            ctx.state = AskNameState()
+
+        @app.handler(background=False)
+        async def handle_name(
+            ctx: Context[Adapter, AskNameState],
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            events.append(f"name:{text}")
+            ctx.state = AskAgeState(name=text)
+
+        @app.handler(background=False)
+        async def handle_age(
+            ctx: Context[Adapter, AskAgeState],
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            events.append(f"age:{ctx.state.name}:{text}")
+            ctx.state = DoneState(name=ctx.state.name, age=int(text))
+
+        @app.handler(background=False)
+        async def status_in_progress(
+            ctx: Context[Adapter, AskNameState | AskAgeState],
+            metadata: EchoMetadata,
+            data: EchoInput,
+            text: str,
+        ) -> None:
+            events.append(f"progress:{ctx.state.step}")
+
+        # Пока состояния нет, ни AskNameState, ни AskAgeState не срабатывают
+        await app.dispatch_event(Input(metadata, text="Alice"), adapter)
+        assert events == []
+
+        # Запуск из пустого состояния (Context[Adapter, None])
+        await app.dispatch_event(Input(metadata, text="start"), adapter)
+        assert events == ["start"]
+
+        # Union состояний матчится на AskNameState
+        await app.dispatch_event(
+            Input(metadata, data=EchoInput(handler_name="echo-data", text="ping")),
+            adapter,
+        )
+        assert events == ["start", "progress:ask_name"]
+
+        # Шаг 1: ввод имени
+        await app.dispatch_event(Input(metadata, text="Alice"), adapter)
+        assert events == ["start", "progress:ask_name", "name:Alice"]
+
+        # Union состояний матчится на AskAgeState
+        await app.dispatch_event(
+            Input(metadata, data=EchoInput(handler_name="echo-data", text="ping")),
+            adapter,
+        )
+        assert events == [
+            "start",
+            "progress:ask_name",
+            "name:Alice",
+            "progress:ask_age",
+        ]
+
+        # Шаг 2: ввод возраста
+        await app.dispatch_event(Input(metadata, text="30"), adapter)
+        assert events == [
+            "start",
+            "progress:ask_name",
+            "name:Alice",
+            "progress:ask_age",
+            "age:Alice:30",
+        ]
+
+        stored = await app.get_state(adapter.context_key(metadata), DoneState)
+        assert stored == DoneState(name="Alice", age=30)
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_default_literal_in_input_data_requires_key_in_payload() -> None:
+    class TaggedInput(InputData):
+        handler_name: Literal["tagged"] = "tagged"
+
+    async def scenario() -> None:
+        app = App()
+        adapter = app.add_adapter(Adapter(app))
+        calls: list[TaggedInput] = []
+
+        @app.handler(background=False)
+        async def on_tagged(
+            ctx: Context,
+            metadata: EchoMetadata,
+            data: TaggedInput,
+            text: str,
+        ) -> None:
+            calls.append(data)
+
+        # Произвольный словарь без handler_name не должен матчиться по дефолту
+        await app.dispatch_event(
+            Input(EchoMetadata(user_id=1), data={"unrelated": 123}),
+            adapter,
+        )
+        assert calls == []
+
+        await app.dispatch_event(
+            Input(EchoMetadata(user_id=1), data=TaggedInput()),
+            adapter,
+        )
+        assert len(calls) == 1
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_context_redraw_accepts_new_state_directly() -> None:
+    class ScreenStep(StateNamespace):
+        step: Literal["ready"] = "ready"
+        uid: int
+
+    async def scenario() -> None:
+        app = App()
+        handle = InterfaceHandle({"cmid": 10})
+        adapter = app.add_adapter(RedrawAdapter(app, [handle]))
+
+        @app.handler(background=False)
+        async def open_screen(
+            ctx: Context,
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            with pytest.raises(TypeError, match="StateNamespace"):
+                ctx.state = {"bad": 1}  # type: ignore[assignment]
+            with pytest.raises(ValueError, match="удалении интерфейса"):
+                await ctx.redraw(None, state=ScreenStep(uid=metadata.user_id))
+            await ctx.redraw(
+                Interface(text="ready"),
+                state=ScreenStep(uid=metadata.user_id),
+            )
+
+        await app.dispatch_event(Input(EchoMetadata(user_id=5)), adapter)
+        assert await app.get_state(handle.state_key(), ScreenStep) == ScreenStep(uid=5)
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_locked_state_loads_mutates_and_saves_atomically() -> None:
+    class CounterModel(BaseModel):
+        count: int = 0
+
+    async def scenario() -> None:
+        app = App()
+        adapter = app.add_adapter(Adapter(app))
+        key = {"counter": "main"}
+
+        # Если записи нет и default не задан -> None, ничего не сохраняется
+        async with app.locked_state(key, CounterModel) as missing:
+            assert missing is None
+        assert await app.get_state(key) is None
+
+        # С default=CounterModel создаётся начальный экземпляр и сохраняется при изменении
+        async with app.locked_state(key, CounterModel, default=CounterModel) as counter:
+            counter.count += 5
+        assert await app.get_state(key, CounterModel) == CounterModel(count=5)
+
+        # Если внутри блока состояние было удалено, оно не восстанавливается
+        async with app.locked_state(key, CounterModel) as counter:
+            assert counter is not None
+            counter.count = 99
+            await app.delete_state(key)
+        assert await app.get_state(key) is None
+
+        # Через ctx.locked_state внутри хендлера
+        await app.set_state(key, CounterModel(count=1))
+
+        @app.handler(background=False)
+        async def bump(
+            ctx: Context,
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            async with ctx.locked_state(key, CounterModel) as item:
+                assert item is not None
+                item.count += 10
+
+        await app.dispatch_event(Input(EchoMetadata(user_id=1)), adapter)
+        assert await app.get_state(key, CounterModel) == CounterModel(count=11)
+        await app.close()
+
+    asyncio.run(scenario())

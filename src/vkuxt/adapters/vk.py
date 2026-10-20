@@ -30,7 +30,7 @@ from ..interfaces import (
     InterfaceHandle,
     TTLValue,
 )
-from ..models import InputData
+from ..models import InputData, StateNamespace
 
 logger = logging.getLogger("vkuxt")
 
@@ -258,13 +258,22 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         interface: VKInterface,
         *,
         reply_to: int | None = None,
+        state: StateNamespace | Mapping[str, Any] | None = None,
     ) -> VKMessageInterface:
-        return await self._send_prepared(
+        validated_state = _coerce_interface_state(state) if state is not None else None
+        handle = await self._send_prepared(
             peer_id,
             interface,
             self._prepare_view(interface),
             reply_to=reply_to,
         )
+        if validated_state is not None:
+            await self.app.set_state(
+                handle.state_key(),
+                validated_state,
+                ttl=handle.ttl,
+            )
+        return handle
 
     async def edit(self, interface: VKMessageInterface, view: VKInterface) -> bool:
         return await self._edit_prepared(interface, view, self._prepare_view(view)) is not None
@@ -305,12 +314,14 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         *,
         target: InterfaceHandle[Any] | None = None,
         peer_id: int | None = None,
+        state: StateNamespace | Mapping[str, Any] | None = None,
     ) -> VKMessageInterface | None:
         """Перерисовать интерфейс одним вызовом.
 
         Без ``target`` и ``peer_id`` используется интерфейс текущего события.
         ``target`` выбирает конкретный существующий интерфейс, ``peer_id`` —
         последний интерфейс указанного диалога. ``interface=None`` удаляет интерфейс.
+        ``state`` сохраняет состояние на итоговом интерфейсе.
         """
         if interface is not None and not isinstance(interface, VKInterface):
             raise TypeError("VK-адаптер принимает VKInterface")
@@ -318,6 +329,9 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             raise TypeError("target должен быть VKMessageInterface")
         if target is not None and peer_id is not None:
             raise ValueError("Укажите target или peer_id, но не оба")
+        if interface is None and state is not None:
+            raise ValueError("Нельзя передать state при удалении интерфейса")
+        validated_state = _coerce_interface_state(state) if state is not None else None
         view = interface
         context = self._vk_event_context.get()
         explicit_target = target is not None
@@ -359,6 +373,7 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             current = None
 
         prepared = self._prepare_view(view)
+        result: VKMessageInterface | None = None
 
         if (
             same_event
@@ -368,16 +383,14 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             and context.metadata._message_cmid is not None
             and current is not None
         ):
-            new_interface = await self._send_prepared(
+            result = await self._send_prepared(
                 recipient,
                 view,
                 prepared,
                 reply_to=context.metadata._message_cmid,
             )
             await self.delete(current)
-            return new_interface
-
-        if (
+        elif (
             same_event
             and context is not None
             and context.from_latest
@@ -386,26 +399,45 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         ):
             # Интерфейс подтянут как последний для обычного текста в личке:
             # считаем его текущим и заменяем после успешной отправки нового.
-            new_interface = await self._send_prepared(recipient, view, prepared)
+            result = await self._send_prepared(recipient, view, prepared)
             await self.delete(current)
-            return new_interface
-
-        if current is not None and (
+        elif current is not None and (
             not same_event
             or (context is not None and context.metadata.event_type == "message_event")
         ):
             try:
-                edited = await self._edit_prepared(current, view, prepared)
+                result = await self._edit_prepared(current, view, prepared)
             except Exception:
                 logger.exception(
                     "Не удалось отредактировать сообщение %s, отправляю новое",
                     current.id,
                 )
-            else:
-                if edited is not None:
-                    return edited
 
-        return await self._send_prepared(recipient, view, prepared)
+        if result is None:
+            result = await self._send_prepared(recipient, view, prepared)
+
+        if validated_state is not None:
+            await self._apply_redraw_state(current, result, validated_state)
+        return result
+
+    async def _apply_redraw_state(
+        self,
+        previous: VKMessageInterface | None,
+        result: VKMessageInterface,
+        state: StateNamespace,
+    ) -> None:
+        new_key = result.state_key()
+        await self.app.set_state(new_key, state, ttl=result.ttl)
+        if previous is not None:
+            previous_key = previous.state_key()
+            if previous_key != new_key and (
+                await self.app._get_interface_record(
+                    previous.id,
+                    platform=previous.platform,
+                )
+                is None
+            ):
+                await self.app.delete_state(previous_key)
 
     def _prepare_view(self, view: VKInterface) -> _PreparedVKInterface:
         view.validate()
@@ -1038,6 +1070,16 @@ def _decode_interface_id(encoded: str) -> VKMessageInterfaceId | None:
     except (TypeError, ValueError) as exc:
         logger.warning("Пропускаю повреждённую запись индекса интерфейсов VK: %s", exc)
         return None
+
+
+def _coerce_interface_state(
+    state: StateNamespace | Mapping[str, Any],
+) -> StateNamespace:
+    if isinstance(state, StateNamespace):
+        return state
+    if isinstance(state, Mapping):
+        return StateNamespace.model_validate(dict(state))
+    raise TypeError("state должен быть StateNamespace, словарём или None")
 
 
 def _json(value: Any) -> str:

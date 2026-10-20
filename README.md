@@ -16,8 +16,8 @@ uv add vkuxt                 # в приложении, когда пакет о
 ## Модель
 
 - `App` передаёт сырой ввод адаптерам по очереди. Первый распознавший формат адаптер возвращает внутренний `Input` с полями `metadata`, `data`, `text` и `interface`; текст и typed payload могут присутствовать одновременно. Прикладной хендлер получает уже не `Input`.
-- Контракт хендлера: `(ctx, metadata, data, text)`. `ctx` — `Context`, привязанный к текущему интерфейсу; `metadata` — экземпляр `BaseMetadata`, `data` — валидированная модель `InputData` или `None`, `text` — строка (пустая, если текста нет). В аннотациях metadata и data указывается одна модель или `Union` моделей через `|`. Диспетчер пропускает хендлер, если metadata не подходит по типу или payload не валидируется ни в одну из указанных data-моделей. `data: None` означает событие без payload; `data: Model | None` принимает оба варианта. `BaseMetadata` и `InputData` в аннотации работают как широкие фильтры.
-- `ctx.state` — изменяемый Pydantic-namespace `StateNamespace` с доступом по атрибутам, привязанный к текущему интерфейсу. После успешного завершения хендлера он сохраняется автоматически. `ctx.redraw(view)` перерисовывает текущий интерфейс и переносит состояние на новый handle; `ctx.redraw(None)` удаляет интерфейс и его состояние. Через `ctx` доступны `ctx.app`, `ctx.adapter`, `ctx.interface` и `ctx.metadata`. Параметризуйте `Context` типом адаптера только там, где нужен его специфичный API (`Context[VKMessagesCallbackAdapter]`); второй параметр (`Context[VKMessagesCallbackAdapter, ScreenState]`) задаёт схему состояния для IDE и валидации.
+- Контракт хендлера: `(ctx, metadata, data, text)`. `ctx` — `Context`, привязанный к текущему интерфейсу; `metadata` — экземпляр `BaseMetadata`, `data` — валидированная модель `InputData` или `None`, `text` — строка (пустая, если текста нет). В аннотациях metadata, data и второго параметра `Context` указывается одна модель или `Union` моделей через `|`. Диспетчер пропускает хендлер, если metadata не подходит по типу, payload не валидируется ни в одну из указанных data-моделей или сохранённое состояние не подходит под модель состояния `Context`. `data: None` означает событие без payload; `data: Model | None` принимает оба варианта. `BaseMetadata`, `InputData` и `StateNamespace` в аннотации работают как широкие фильтры.
+- `ctx.state` — изменяемый Pydantic-namespace `StateNamespace` с доступом по атрибутам, привязанный к текущему интерфейсу. После успешного завершения хендлера он сохраняется автоматически. `ctx.redraw(view, state=...)` перерисовывает текущий интерфейс и переносит (или обновляет) состояние на новый handle; `ctx.redraw(None)` удаляет интерфейс и его состояние. Через `ctx` доступны `ctx.app`, `ctx.adapter`, `ctx.interface`, `ctx.metadata` и `ctx.locked_state(...)`. Параметризуйте `Context` типом адаптера только там, где нужен его специфичный API (`Context[VKMessagesCallbackAdapter]`); второй параметр (`Context[VKMessagesCallbackAdapter, WaitingCodeState]`) одновременно задаёт схему состояния для IDE и фильтрует вызов хендлера по текущему шагу экрана (`None` во втором параметре матчится на пустое состояние).
 - По умолчанию хендлеры fire-and-forget: `App.dispatch_event` только запускает их в одной `asyncio.Task` и сразу возвращает управление. `await app.wait_background()` ждёт завершения; `App.close()` также дренирует задачи. `@app.handler(background=False)` оставляет явный foreground-режим: такие хендлеры вызываются последовательно, а первый непустой результат возвращается адаптеру. `raise StopHandlerChain` прекращает текущую фазу опроса.
 - `InputData` и `StateNamespace` проверяют строгую JSON-сериализуемость при Pydantic-валидации и присваивании. `handler_name` — обычное поле данных; диспетчер не интерпретирует его. Чтобы не передавать `handler_name` вручную, задайте значение по умолчанию прямо в модели: `handler_name: Literal["ttt.close"] = "ttt.close"`.
 - Ключи приложения — обычные словари, dataclass'ы или Pydantic-модели. `encode_key` канонически сериализует их; данные сортируются по ключам, а тип по умолчанию кодируется полным именем класса. Для стабильного тега можно объявить `__vkuxt_key_type__: ClassVar[str]`, чтобы перенос модуля не ломал сохранённые ключи. Storage-ключи версионированы (`vkuxt:v1:...`); ключи предыдущих alpha-версий без `v1` не читаются.
@@ -108,9 +108,10 @@ Redis-бэкенд намеренно не входит в библиотеку:
 
 `ctx.state` — изменяемый Pydantic-namespace `StateNamespace`, а не словарь. Поля читаются и пишутся как атрибуты, объявленные в подклассе поля видны IDE и валидируются при присваивании, а необъявленные атрибуты разрешены и сохраняются как extra-поля. Значения обязаны сериализоваться в строгий JSON; проверка выполняется при каждом присваивании. Состояние автоматически сохраняется после успешного хендлера. При наличии интерфейса оно хранится под стабильным `InterfaceHandle.state_key()`; при событии без интерфейса используется ключ `Adapter.context_key(metadata)`. `ctx.redraw(view)` переносит состояние на новый handle, а `ctx.redraw(None)` удаляет его вместе с интерфейсом. Для общего состояния, разделяемого несколькими интерфейсами (например, партии на двух досках), по-прежнему используйте `app.get_state`/`app.set_state`; это необязательное удобство, прикладной слой может хранить такие данные где угодно. Сам handle как ключ использовать нельзя: его `actions` и `ttl` меняются. Внутренние записи интерфейсов vkuxt хранит под непрозрачными ID адаптера, чтобы переживать перерисовки и длинные callback-payload'ы.
 
-Схему состояния можно объявить вторым параметром `Context`:
+Схему и фильтр состояния экрана можно объявить вторым параметром `Context`:
 
 ```python
+from typing import Literal
 from vkuxt import (
     Context,
     StateNamespace,
@@ -120,30 +121,39 @@ from vkuxt import (
 )
 
 
-class ScreenState(StateNamespace):
-    uid: int = 0
-    game_id: str = ""
-    seat: int = 0
+class WaitingCodeState(StateNamespace):
+    phase: Literal["waiting_code"] = "waiting_code"
+    uid: int
 
 
-view = VKInterface(text="Игра")
+view = VKInterface(text="Введите код игры:")
 
 
 @app.handler
-async def show_game(
-    ctx: Context[VKMessagesCallbackAdapter, ScreenState],
+async def ask_code(
+    ctx: Context[VKMessagesCallbackAdapter],
     metadata: VKMessageMetadata,
     data: None,
     text: str,
 ) -> None:
-    ctx.state.uid = metadata.user_id
-    ctx.state.extra_value = "сохранится как extra-поле"
-    await ctx.redraw(view)
+    if text.casefold() == "код":
+        await ctx.redraw(view, state=WaitingCodeState(uid=metadata.user_id))
+
+
+@app.handler
+async def on_code_entered(
+    ctx: Context[VKMessagesCallbackAdapter, WaitingCodeState],
+    metadata: VKMessageMetadata,
+    data: None,
+    text: str,
+) -> None:
+    # Вызывается только когда интерфейс находится в состоянии WaitingCodeState
+    ...
 ```
 
-Второй параметр необязателен: голый `Context` использует базовый `StateNamespace`, где доступны любые атрибуты, но IDE не знает их имён. Поля типизированного namespace должны иметь значения по умолчанию, чтобы состояние можно было создать при первом событии. Если сохранённого JSON нет или он не соответствует модели, `App` создаёт namespace из значений по умолчанию либо сообщает об ошибке загрузки.
+Второй параметр необязателен: голый `Context` использует базовый `StateNamespace`, который подходит под любое состояние. Специализированные подклассы `StateNamespace` (с обязательными полями или `Literal`-тегом шага) работают как типобезопасные состояния экрана: хендлер вызывается только тогда, когда сохранённое состояние проходит валидацию указанной модели (или `Union` моделей). Для перехода между состояниями присвойте `ctx.state = NextState(...)` или передайте `state=NextState(...)` в `ctx.redraw(view, state=...)` / `adapter.redraw(view, peer_id=..., state=...)`. Если у модели все поля имеют обычные значения по умолчанию без `Literal`-дискриминаторов, она создаётся автоматически и при пустом состоянии; `Context[Adapter, None]` матчится только тогда, когда состояния ещё нет.
 
-Бизнес-состояние можно хранить Pydantic-моделью, а не словарём:
+Бизнес-состояние можно хранить Pydantic-моделью и атомарно обновлять под блокировкой через `ctx.locked_state` (или `app.locked_state`):
 
 ```python
 class GameState(BaseModel):
@@ -153,15 +163,13 @@ class GameState(BaseModel):
     turn: int
 
 
-async with ctx.app.lock(game_key):
-    game = await ctx.app.get_state(game_key, GameState)
+async with ctx.locked_state(game_key, GameState, ttl=GAME_TTL) as game:
     if game is None:
         return
     game.turn = 1 - game.turn
-    await ctx.app.set_state(game_key, game, ttl=GAME_TTL)
 ```
 
-`set_state` сериализует модель в JSON, `get_state(key, GameState)` валидирует её обратно. С `JSONFileStorage` состояние переживает перезапуск приложения и снова приходит типизированным объектом; отдельного общего `app.state`-словаря нет, потому что ключ и TTL задаются явно.
+`locked_state` захватывает `lock(game_key)`, читает `get_state(game_key, GameState)` (или создаёт начальное значение из `default=...`) и при выходе из блока без ошибки автоматически сохраняет изменённую модель в storage. `set_state` и `get_state(key, GameState)` остаются доступны для явных операций. С `JSONFileStorage` состояние переживает перезапуск приложения и снова приходит типизированным объектом; отдельного общего `app.state`-словаря нет, потому что ключ и TTL задаются явно.
 
 `JSONFileStorage` рассчитан на один процесс и один экземпляр на файл: параллельная запись из нескольких процессов или экземпляров не поддерживается. Повреждённый JSON при старте приводит к `RuntimeError` с путём файла, а не к тихой перезаписи.
 
@@ -196,6 +204,4 @@ VK Callback адаптер использует `vkx.server.CallbackServer` дл
 При fire-and-forget обработке `sendMessageEventAnswer` отправляется сразу после запуска фоновой задачи, не дожидаясь её завершения. Это укладывается в окно ответа VK; если нужен результат хендлера до ответа, используйте `background=False`, но держите такой путь коротким.
 
 Полный скетч крестиков-ноликов, включая лобби с кодом, ввод кода ответом на сообщение, две синхронизируемые доски и сдачу, находится в [`examples/tictactoe.py`](examples/tictactoe.py).
-
-Пошаговое заполнение анкеты с текстовым вводом, выбором кнопками, проверкой значений, просмотром сохранённой анкеты и повторным заполнением — в [`examples/profile_form.py`](examples/profile_form.py).
 

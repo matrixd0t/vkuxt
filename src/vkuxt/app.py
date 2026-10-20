@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
 import types
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager, suppress
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import (
     Annotated,
     Any,
     ClassVar,
     ForwardRef,
+    Literal,
+    NoDefault,
     TypeAliasType,
     TypeVar,
     Union,
@@ -44,6 +47,7 @@ from .storage import MemoryStorage, StateStorage
 
 logger = logging.getLogger("vkuxt")
 
+_MISSING = object()
 StateT = TypeVar("StateT")
 AdapterT = TypeVar("AdapterT", bound="Adapter")
 Handler = Callable[..., Any]
@@ -129,33 +133,70 @@ class Adapter:
         """Остановить фоновые задачи адаптера."""
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, init=False)
 class Context[
     AdapterT: Adapter = Adapter,
-    StateT: StateNamespace = StateNamespace,
+    StateT: StateNamespace | None = StateNamespace,
 ]:
     """Контекст одного хендлера: интерфейс, состояние и доступ к приложению.
 
     ``state`` — изменяемый JSON-namespace, привязанный к текущему интерфейсу.
     Поля можно читать и писать как атрибуты; необъявленные атрибуты
     сохраняются. После успешного завершения хендлера состояние сохраняется
-    автоматически. Тип namespace задаётся вторым параметром ``Context``.
+    автоматически. Второй параметр ``Context`` задаёт модель (или ``Union``
+    моделей) состояния, при которой вызывается хендлер.
     """
 
     app: App
     adapter: AdapterT
     interface: InterfaceHandle[Any] | None
     metadata: BaseMetadata
-    state: StateT
+    _state: StateNamespace
     _state_key: KeyLike | None
-    _state_ttl: TTLValue = DEFAULT_TTL
-    _state_cache: dict[str, dict[str, Any] | None] | None = None
+    _state_ttl: TTLValue
+    _state_cache: dict[str, dict[str, Any] | None] | None
+
+    def __init__(
+        self,
+        app: App,
+        adapter: AdapterT,
+        interface: InterfaceHandle[Any] | None,
+        metadata: BaseMetadata,
+        state: StateNamespace,
+        _state_key: KeyLike | None,
+        _state_ttl: TTLValue = DEFAULT_TTL,
+        _state_cache: dict[str, dict[str, Any] | None] | None = None,
+    ) -> None:
+        self.app = app
+        self.adapter = adapter
+        self.interface = interface
+        self.metadata = metadata
+        self.state = state
+        self._state_key = _state_key
+        self._state_ttl = _state_ttl
+        self._state_cache = _state_cache
+
+    @property
+    def state(self) -> StateT:
+        return cast(StateT, self._state)
+
+    @state.setter
+    def state(self, value: StateNamespace) -> None:
+        if not isinstance(value, StateNamespace):
+            raise TypeError("state должен быть экземпляром StateNamespace")
+        self._state = value
 
     async def redraw(
         self,
         interface: Interface[Any] | None,
+        *,
+        state: StateNamespace | None = None,
     ) -> InterfaceHandle[Any] | None:
         """Перерисовать текущий интерфейс и перенести состояние на новый."""
+        if interface is None and state is not None:
+            raise ValueError("Нельзя передать state при удалении интерфейса")
+        if state is not None:
+            self.state = state
         previous = self.interface
         previous_key = self._state_key
         result = await self.adapter.redraw(interface, target=previous)
@@ -170,7 +211,7 @@ class Context[
 
         new_key = result.state_key()
         if new_key != previous_key:
-            await self.app.set_state(new_key, self.state, ttl=result.ttl)
+            await self.app.set_state(new_key, self._state, ttl=result.ttl)
             self._remember_cached_state(new_key)
             if previous_key is not None and (
                 previous is None
@@ -183,8 +224,52 @@ class Context[
                 await self.app.delete_state(previous_key)
                 self._forget_cached_state(previous_key)
             self._state_key = new_key
+        elif state is not None:
+            await self.app.set_state(new_key, self._state, ttl=result.ttl)
+            self._remember_cached_state(new_key)
         self._state_ttl = result.ttl
         return result
+
+    @overload
+    def locked_state(
+        self,
+        key: KeyLike,
+        model: None = None,
+        *,
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> AbstractAsyncContextManager[Any | None]: ...
+
+    @overload
+    def locked_state[ModelT](
+        self,
+        key: KeyLike,
+        model: type[ModelT],
+        *,
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> AbstractAsyncContextManager[ModelT | None]: ...
+
+    @overload
+    def locked_state[ModelT](
+        self,
+        key: KeyLike,
+        model: type[ModelT],
+        *,
+        default: ModelT | Callable[[], ModelT],
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> AbstractAsyncContextManager[ModelT]: ...
+
+    def locked_state(
+        self,
+        key: KeyLike,
+        model: type[Any] | None = None,
+        *,
+        default: Any = _MISSING,
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> AbstractAsyncContextManager[Any]:
+        """Заблокировать ключ, загрузить состояние и сохранить изменения при выходе."""
+        if default is _MISSING:
+            return self.app.locked_state(key, model, ttl=ttl)
+        return self.app.locked_state(key, model, default=default, ttl=ttl)  # type: ignore[arg-type]
 
     async def _save(self) -> None:
         if self._state_key is None:
@@ -192,15 +277,15 @@ class Context[
         if self.interface is not None and self.interface.deleted:
             self._forget_cached_state(self._state_key)
             return
-        await self.app.set_state(self._state_key, self.state, ttl=self._state_ttl)
+        await self.app.set_state(self._state_key, self._state, ttl=self._state_ttl)
         self._remember_cached_state(self._state_key)
 
     def _remember_cached_state(self, state_key: KeyLike) -> None:
         if self._state_cache is not None:
             state = (
-                self.state.model_dump(mode="json")
-                if isinstance(self.state, BaseModel)
-                else self.state
+                self._state.model_dump(mode="json")
+                if isinstance(self._state, BaseModel)
+                else self._state
             )
             self._state_cache[encode_key(state_key)] = state
 
@@ -217,7 +302,8 @@ class _HandlerEntry:
     metadata_types: tuple[type[BaseMetadata], ...]
     data_models: tuple[type[InputData], ...]
     accepts_missing_data: bool
-    state_type: type[StateNamespace]
+    state_models: tuple[type[StateNamespace], ...]
+    accepts_empty_state: bool
 
 
 class StopHandlerChain(Exception):
@@ -312,7 +398,8 @@ class App:
             metadata_types,
             data_models,
             accepts_missing_data,
-            state_type,
+            state_models,
+            accepts_empty_state,
         ) = _handler_annotations(function, localns)
         entry = _HandlerEntry(
             order=len(self._handlers),
@@ -321,7 +408,8 @@ class App:
             metadata_types=metadata_types,
             data_models=data_models,
             accepts_missing_data=accepts_missing_data,
-            state_type=state_type,
+            state_models=state_models,
+            accepts_empty_state=accepts_empty_state,
         )
         self._handlers.append(entry)
         for metadata_type in metadata_types:
@@ -345,11 +433,19 @@ class App:
         entries = self._matching_handlers(_input.metadata)
         payload = _input.data.model_dump(mode="python") if _input.data is not None else None
         cache: dict[type[InputData], InputData | None] = {}
+        initial_state_cache: dict[str, dict[str, Any] | None] = {}
         state_cache: dict[str, dict[str, Any] | None] = {}
         for entry in entries:
             if not entry.background:
                 matched, data = self._data_for_handler(entry, payload, cache)
                 if not matched:
+                    continue
+                if not await self._matches_state(
+                    adapter,
+                    _input,
+                    entry,
+                    initial_state_cache,
+                ):
                     continue
                 try:
                     result = await self._invoke(
@@ -358,6 +454,7 @@ class App:
                         _input,
                         data,
                         state_cache,
+                        initial_state_cache,
                     )
                 except StopHandlerChain:
                     break
@@ -369,11 +466,32 @@ class App:
             if not entry.background:
                 continue
             matched, data = self._data_for_handler(entry, payload, cache)
-            if matched:
-                background_entries.append((entry, data))
+            if not matched:
+                continue
+            if not await self._matches_state(
+                adapter,
+                _input,
+                entry,
+                initial_state_cache,
+            ):
+                continue
+            if not await self._matches_state(
+                adapter,
+                _input,
+                entry,
+                state_cache,
+            ):
+                continue
+            background_entries.append((entry, data))
         if background_entries:
             task = asyncio.create_task(
-                self._run_background_handlers(tuple(background_entries), adapter, _input)
+                self._run_background_handlers(
+                    tuple(background_entries),
+                    adapter,
+                    _input,
+                    dict(state_cache),
+                    dict(initial_state_cache),
+                )
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_task_done)
@@ -384,11 +502,21 @@ class App:
         entries: tuple[tuple[_HandlerEntry, InputData | None], ...],
         adapter: Adapter,
         event: Input,
+        state_cache: dict[str, dict[str, Any] | None] | None = None,
+        initial_state_cache: dict[str, dict[str, Any] | None] | None = None,
     ) -> None:
-        state_cache: dict[str, dict[str, Any] | None] = {}
+        if state_cache is None:
+            state_cache = {}
         for entry, data in entries:
             try:
-                await self._invoke(entry, adapter, event, data, state_cache)
+                await self._invoke(
+                    entry,
+                    adapter,
+                    event,
+                    data,
+                    state_cache,
+                    initial_state_cache,
+                )
             except StopHandlerChain:
                 return
             except Exception:
@@ -417,10 +545,13 @@ class App:
             if model in cache:
                 data = cache[model]
             else:
-                try:
-                    data = model.model_validate(payload)
-                except ValidationError:
+                if not _has_required_literals(model, payload):
                     data = None
+                else:
+                    try:
+                        data = model.model_validate(payload)
+                    except ValidationError:
+                        data = None
                 cache[model] = data
             if data is not None:
                 return True, data
@@ -474,13 +605,73 @@ class App:
             await asyncio.gather(*tasks, return_exceptions=True)
             self._background_tasks.difference_update(tasks)
 
+    async def _raw_context_state(
+        self,
+        state_key: KeyLike,
+        state_cache: dict[str, dict[str, Any] | None] | None,
+    ) -> dict[str, Any] | None:
+        cache_key = encode_key(state_key)
+        if state_cache is not None and cache_key in state_cache:
+            return state_cache[cache_key]
+        raw_state = await self.get_state(state_key)
+        if raw_state is not None and not isinstance(raw_state, dict):
+            raise TypeError("Состояние контекста должно быть JSON-объектом")
+        if state_cache is not None:
+            state_cache[cache_key] = raw_state
+        return raw_state
+
+    async def _matches_state(
+        self,
+        adapter: Adapter,
+        event: Input,
+        entry: _HandlerEntry,
+        state_cache: dict[str, dict[str, Any] | None] | None = None,
+    ) -> bool:
+        if StateNamespace in entry.state_models:
+            return True
+        state_key = (
+            event.interface.state_key()
+            if event.interface is not None
+            else adapter.context_key(event.metadata)
+        )
+        raw_state = await self._raw_context_state(state_key, state_cache)
+        return self._build_state_for_handler(entry, raw_state) is not None
+
+    @staticmethod
+    def _build_state_for_handler(
+        entry: _HandlerEntry,
+        raw_state: dict[str, Any] | None,
+    ) -> StateNamespace | None:
+        if not raw_state:
+            for model in entry.state_models:
+                if model is StateNamespace:
+                    return StateNamespace()
+                if _can_instantiate_empty_state(model):
+                    try:
+                        return model()
+                    except ValidationError:
+                        continue
+            if entry.accepts_empty_state:
+                return StateNamespace()
+            return None
+
+        for model in entry.state_models:
+            if not _has_required_literals(model, raw_state):
+                continue
+            try:
+                return model.model_validate(raw_state)
+            except ValidationError:
+                continue
+        return None
+
     async def _context_for(
         self,
         adapter: Adapter,
         event: Input,
-        state_type: type[StateNamespace],
+        entry: _HandlerEntry,
         state_cache: dict[str, dict[str, Any] | None] | None = None,
-    ) -> Context[Any, Any]:
+        initial_state_cache: dict[str, dict[str, Any] | None] | None = None,
+    ) -> Context[Any, Any] | None:
         interface = event.interface
         if interface is not None:
             state_key: KeyLike = interface.state_key()
@@ -489,29 +680,12 @@ class App:
             state_key = adapter.context_key(event.metadata)
             state_ttl = self.ttl
         cache_key = encode_key(state_key)
-        if state_cache is not None and cache_key in state_cache:
-            raw_state = state_cache[cache_key]
-        else:
-            raw_state = await self.get_state(state_key)
-            if raw_state is not None and not isinstance(raw_state, dict):
-                raise TypeError("Состояние контекста должно быть JSON-объектом")
-            if state_cache is not None:
-                state_cache[cache_key] = raw_state
-        if raw_state is None:
-            try:
-                state = state_type()
-            except ValidationError as exc:
-                raise TypeError(
-                    f"Не удалось создать состояние {state_type.__name__}; "
-                    "поля без сохранённых значений должны иметь значения по умолчанию"
-                ) from exc
-        else:
-            try:
-                state = state_type.model_validate(raw_state)
-            except ValidationError as exc:
-                raise TypeError(
-                    f"Сохранённое состояние не соответствует {state_type.__name__}"
-                ) from exc
+        raw_state = await self._raw_context_state(state_key, state_cache)
+        if initial_state_cache is not None and cache_key not in initial_state_cache:
+            initial_state_cache[cache_key] = raw_state
+        state = self._build_state_for_handler(entry, raw_state)
+        if state is None:
+            return None
         return Context(
             app=self,
             adapter=adapter,
@@ -530,13 +704,17 @@ class App:
         event: Input,
         data: InputData | None,
         state_cache: dict[str, dict[str, Any] | None] | None = None,
+        initial_state_cache: dict[str, dict[str, Any] | None] | None = None,
     ) -> Any:
         context = await self._context_for(
             adapter,
             event,
-            entry.state_type,
+            entry,
             state_cache,
+            initial_state_cache,
         )
+        if context is None:
+            return None
         try:
             result = entry.function(
                 context,
@@ -625,6 +803,10 @@ class App:
         raw = await self.storage.get(storage_key("state", key))
         if raw is None:
             return None
+        return self._deserialize_state(raw, model)
+
+    @staticmethod
+    def _deserialize_state(raw: str, model: type[StateT] | None = None) -> Any:
         if model is None:
             return json.loads(raw)
         data = json.loads(raw)
@@ -636,23 +818,99 @@ class App:
             return model.from_json(raw)  # type: ignore[attr-defined, no-any-return]
         return model(**data)  # type: ignore[call-arg, no-any-return]
 
-    async def set_state(self, key: KeyLike, value: Any, *, ttl: TTLValue = DEFAULT_TTL) -> None:
+    @staticmethod
+    def _serialize_state(value: Any) -> str:
         if isinstance(value, BaseModel) or hasattr(value, "model_dump"):
             data = value.model_dump(mode="json")
         elif is_dataclass(value) and not isinstance(value, type):
             data = asdict(value)
         else:
             data = value
+        return _json(data)
+
+    async def set_state(self, key: KeyLike, value: Any, *, ttl: TTLValue = DEFAULT_TTL) -> None:
         lifetime = self.ttl if isinstance(ttl, _DefaultTTL) else ttl
         if lifetime is not None and lifetime <= 0:
             raise ValueError("ttl должен быть больше нуля или None")
-        await self.storage.set(storage_key("state", key), _json(data), ttl=lifetime)
+        await self.storage.set(
+            storage_key("state", key),
+            self._serialize_state(value),
+            ttl=lifetime,
+        )
 
     async def delete_state(self, key: KeyLike) -> None:
         await self.storage.delete(storage_key("state", key))
 
     def lock(self, *keys: KeyLike) -> LockedKeys:
         return self._locks.lock(*keys)
+
+    @overload
+    def locked_state(
+        self,
+        key: KeyLike,
+        model: None = None,
+        *,
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> AbstractAsyncContextManager[Any | None]: ...
+
+    @overload
+    def locked_state(
+        self,
+        key: KeyLike,
+        model: type[StateT],
+        *,
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> AbstractAsyncContextManager[StateT | None]: ...
+
+    @overload
+    def locked_state(
+        self,
+        key: KeyLike,
+        model: type[StateT],
+        *,
+        default: StateT | Callable[[], StateT],
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> AbstractAsyncContextManager[StateT]: ...
+
+    @asynccontextmanager
+    async def locked_state(
+        self,
+        key: KeyLike,
+        model: type[StateT] | None = None,
+        *,
+        default: Any = _MISSING,
+        ttl: TTLValue = DEFAULT_TTL,
+    ) -> AsyncIterator[Any]:
+        """Заблокировать ключ, загрузить состояние и сохранить изменения при выходе."""
+        lifetime = self.ttl if isinstance(ttl, _DefaultTTL) else ttl
+        if lifetime is not None and lifetime <= 0:
+            raise ValueError("ttl должен быть больше нуля или None")
+        skey = storage_key("state", key)
+        async with self.lock(key):
+            raw_before = await self.storage.get(skey)
+            if raw_before is None:
+                if default is _MISSING:
+                    value = None
+                elif callable(default):
+                    value = default()
+                elif isinstance(default, BaseModel):
+                    value = default.model_copy(deep=True)
+                else:
+                    value = copy.deepcopy(default)
+            else:
+                value = self._deserialize_state(raw_before, model)
+            before_serialized = (
+                self._serialize_state(value) if value is not None else None
+            )
+            yield value
+            if value is None:
+                return
+            after_serialized = self._serialize_state(value)
+            if after_serialized == before_serialized:
+                return
+            if raw_before is not None and await self.storage.get(skey) is None:
+                return
+            await self.storage.set(skey, after_serialized, ttl=lifetime)
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -803,7 +1061,8 @@ def _handler_annotations(
     tuple[type[BaseMetadata], ...],
     tuple[type[InputData], ...],
     bool,
-    type[StateNamespace],
+    tuple[type[StateNamespace], ...],
+    bool,
 ]:
     try:
         all_parameters = list(inspect.signature(function).parameters.values())
@@ -841,41 +1100,129 @@ def _handler_annotations(
         isinstance(ctx_type, type) and issubclass(ctx_type, Context)
     ):
         raise TypeError("Аннотация ctx должна быть Context")
-    state_type = _context_state_type(ctx_annotation, ctx_type)
+    state_models, accepts_empty_state = _context_state_types(ctx_annotation, ctx_type)
 
     metadata_types = _metadata_annotation_types(metadata_annotation)
     data_models, accepts_missing_data = _data_annotation_types(data_annotation)
     if _unwrap_annotation(text_annotation) is not str:
         raise TypeError("Аннотация text должна быть str")
-    return metadata_types, data_models, accepts_missing_data, state_type
+    return (
+        metadata_types,
+        data_models,
+        accepts_missing_data,
+        state_models,
+        accepts_empty_state,
+    )
 
 
-def _context_state_type(annotation: Any, ctx_type: Any) -> type[StateNamespace]:
+def _context_state_types(
+    annotation: Any,
+    ctx_type: Any,
+) -> tuple[tuple[type[StateNamespace], ...], bool]:
     if ctx_type in (inspect.Signature.empty, Any) or ctx_type is not Context:
-        return StateNamespace
+        return (StateNamespace,), True
     arguments = get_args(annotation)
     if len(arguments) > 2:
         raise TypeError(
             "Context принимает не больше двух параметров: адаптер и тип состояния"
         )
     if len(arguments) < 2:
-        return StateNamespace
+        return (StateNamespace,), True
     state_annotation = _unwrap_annotation(arguments[1])
     if state_annotation is Any:
-        return StateNamespace
-    if not (
-        isinstance(state_annotation, type)
-        and issubclass(state_annotation, StateNamespace)
-    ):
-        raise TypeError(
-            "Второй параметр Context должен наследоваться от StateNamespace"
+        return (StateNamespace,), True
+    if isinstance(state_annotation, (str, ForwardRef)):
+        raise TypeError(f"Не удалось разрешить аннотацию state {state_annotation!r}")
+    state_models: list[type[StateNamespace]] = []
+    accepts_empty_state = False
+    for state_type in _type_alternatives(state_annotation):
+        if state_type is type(None):
+            accepts_empty_state = True
+        elif isinstance(state_type, type) and issubclass(state_type, StateNamespace):
+            if state_type not in state_models:
+                state_models.append(state_type)
+        else:
+            raise TypeError(
+                "Второй параметр Context должен наследоваться от StateNamespace или быть None"
+            )
+    return tuple(state_models), accepts_empty_state
+
+
+def _is_non_null_literal(annotation: Any) -> bool:
+    annotation = _unwrap_annotation(annotation)
+    if get_origin(annotation) is Literal:
+        return all(arg is not None for arg in get_args(annotation))
+    if get_origin(annotation) in (Union, types.UnionType):
+        alternatives = _type_alternatives(annotation)
+        return bool(alternatives) and all(
+            get_origin(alt) is Literal and all(arg is not None for arg in get_args(alt))
+            for alt in alternatives
         )
-    return state_annotation
+    return False
+
+
+def _required_literal_fields(
+    model: type[BaseModel],
+) -> tuple[tuple[str, str | None], ...]:
+    fields: list[tuple[str, str | None]] = []
+    for name, field_info in model.model_fields.items():
+        if _is_non_null_literal(field_info.annotation):
+            fields.append((name, field_info.alias))
+    return tuple(fields)
+
+
+def _has_required_literals(
+    model: type[BaseModel],
+    raw: Mapping[str, Any],
+) -> bool:
+    for name, alias in _required_literal_fields(model):
+        if name not in raw and (alias is None or alias not in raw):
+            return False
+    return True
+
+
+def _can_instantiate_empty_state(model: type[StateNamespace]) -> bool:
+    if model is StateNamespace:
+        return True
+    if _required_literal_fields(model):
+        return False
+    return not any(field.is_required() for field in model.model_fields.values())
+
+
+def _type_param_default(param: Any) -> Any:
+    default = getattr(param, "__default__", NoDefault)
+    if default is not NoDefault:
+        return default
+    bound = getattr(param, "__bound__", None)
+    return bound if bound is not None else Any
 
 
 def _expand_type_alias(annotation: Any) -> Any:
-    while isinstance(annotation, TypeAliasType):
-        annotation = annotation.__value__
+    while True:
+        if isinstance(annotation, TypeAliasType):
+            if annotation.__type_params__:
+                defaults = tuple(
+                    _type_param_default(param)
+                    for param in annotation.__type_params__
+                )
+                annotation = annotation.__value__[defaults]
+            else:
+                annotation = annotation.__value__
+            continue
+        origin = get_origin(annotation)
+        if isinstance(origin, TypeAliasType):
+            args = get_args(annotation)
+            if len(args) < len(origin.__type_params__):
+                args = args + tuple(
+                    _type_param_default(param)
+                    for param in origin.__type_params__[len(args) :]
+                )
+            annotation = origin.__value__[args]
+            continue
+        if isinstance(annotation, TypeVar):
+            annotation = _type_param_default(annotation)
+            continue
+        break
     return annotation
 
 

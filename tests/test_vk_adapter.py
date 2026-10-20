@@ -19,6 +19,7 @@ from vkuxt import (
     JSONFileStorage,
     KeyboardButtonColor,
     MemoryStorage,
+    StateNamespace,
     VKCallbackAdapter,
     VKInterface,
     VKMessageInterface,
@@ -969,6 +970,40 @@ def test_redraw_revalidates_a_mutated_interface() -> None:
         with pytest.raises(ValueError, match="4096"):
             await adapter.redraw(view, peer_id=5)
         assert await app.storage.get(_peer_index_key(71, 5)) is None
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_send_and_redraw_persist_passed_state() -> None:
+    class ScreenState(StateNamespace):
+        phase: Literal["board"] = "board"
+        seat: int
+
+    async def scenario() -> None:
+        app = App(MemoryStorage())
+        vk = FakeVK()
+        adapter = add_vk_adapter(app, vk)
+
+        sent = await adapter.send(
+            5,
+            VKInterface(text="initial", ttl=120),
+            state=ScreenState(seat=0),
+        )
+        assert await app.get_state(sent.state_key(), ScreenState) == ScreenState(seat=0)
+
+        updated = await adapter.redraw(
+            VKInterface(text="updated", ttl=120),
+            peer_id=5,
+            state=ScreenState(seat=1),
+        )
+        assert updated is not None
+        assert updated.id == sent.id
+        assert await app.get_state(updated.state_key(), ScreenState) == ScreenState(seat=1)
+
+        with pytest.raises(ValueError, match="удалении интерфейса"):
+            await adapter.redraw(None, peer_id=5, state=ScreenState(seat=0))
+
         await app.close()
 
     asyncio.run(scenario())

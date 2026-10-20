@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -62,14 +62,34 @@ CREATE_FAILED_VIEW = VKInterface(
 )
 
 
-class TicTacToeState(StateNamespace):
-    uid: int = 0
-    code: str = ""
-    game_id: str = ""
-    seat: int = 0
+class ScreenState(StateNamespace):
+    uid: int
 
 
-type VKContext = Context[VKMessagesCallbackAdapter, TicTacToeState]
+class MenuState(ScreenState):
+    phase: Literal["menu"] = "menu"
+
+
+class WaitingCodeState(ScreenState):
+    phase: Literal["waiting_code"] = "waiting_code"
+
+
+class LobbyScreenState(ScreenState):
+    phase: Literal["lobby"] = "lobby"
+    code: str
+
+
+class GameScreenState(ScreenState):
+    phase: Literal["game"] = "game"
+    game_id: str
+    seat: int
+
+
+TicTacToeState = ScreenState
+type VKContext[StateT: StateNamespace | None = StateNamespace] = Context[
+    VKMessagesCallbackAdapter,
+    StateT,
+]
 
 
 class TicTacToeInput(InputData):
@@ -173,24 +193,6 @@ def is_player(
         player.user_id == metadata.user_id
         and player.peer_id == metadata.peer_id
     )
-
-
-def apply_screen_state(
-    state: TicTacToeState,
-    game: GameState,
-    seat: int,
-) -> None:
-    player = game.players[seat]
-    state.uid = player.user_id
-    state.code = ""
-    state.game_id = game.game_id
-    state.seat = seat
-
-
-def new_screen_state(game: GameState, seat: int) -> TicTacToeState:
-    state = TicTacToeState()
-    apply_screen_state(state, game, seat)
-    return state
 
 
 def apply_game_action(
@@ -355,23 +357,25 @@ def game_view(game: GameState, seat: int) -> VKInterface:
 
 
 async def draw_game(
-    ctx: VKContext,
+    ctx: VKContext[Any],
     metadata: VKMessageMetadata,
     game: GameState,
 ) -> None:
     for seat, player in enumerate(game.players):
         view = game_view(game, seat)
+        state = GameScreenState(
+            uid=player.user_id,
+            game_id=game.game_id,
+            seat=seat,
+        )
         if player.peer_id == metadata.peer_id:
-            apply_screen_state(ctx.state, game, seat)
-            await ctx.redraw(view)
+            await ctx.redraw(view, state=state)
         else:
-            handle = await ctx.adapter.redraw(view, peer_id=player.peer_id)
-            if handle is not None:
-                await ctx.app.set_state(
-                    handle.state_key(),
-                    new_screen_state(game, seat),
-                    ttl=GAME_TTL,
-                )
+            await ctx.adapter.redraw(
+                view,
+                peer_id=player.peer_id,
+                state=state,
+            )
 
 
 async def menu(
@@ -382,17 +386,21 @@ async def menu(
 ) -> None:
     if text.strip().casefold() not in {"начать", "меню"}:
         return
-    ctx.state.uid = metadata.user_id
-    await ctx.redraw(menu_view(metadata.user_id))
+    await ctx.redraw(
+        menu_view(metadata.user_id),
+        state=MenuState(uid=metadata.user_id),
+    )
 
 
 async def create_lobby(
-    ctx: VKContext,
+    ctx: VKContext[MenuState],
     metadata: VKMessageMetadata,
     data: CreateLobbyInput,
     text: str,
 ) -> None:
-    if data.uid != metadata.user_id:
+    if ctx.state.uid != metadata.user_id:
+        return
+    if data.uid is not None and data.uid != metadata.user_id:
         return
     for _ in range(8):
         code = secrets.token_hex(3).upper()
@@ -409,32 +417,39 @@ async def create_lobby(
                 LobbyState(owner=owner),
                 ttl=LOBBY_TTL,
             )
-        ctx.state.uid = metadata.user_id
-        ctx.state.code = code
-        await ctx.redraw(lobby_view(code))
+        await ctx.redraw(
+            lobby_view(code),
+            state=LobbyScreenState(uid=metadata.user_id, code=code),
+        )
         return
     await ctx.redraw(CREATE_FAILED_VIEW)
 
 
 async def ask_join_code(
-    ctx: VKContext,
+    ctx: VKContext[MenuState],
     metadata: VKMessageMetadata,
     data: AskJoinCodeInput,
     text: str,
 ) -> None:
-    if data.uid != metadata.user_id:
+    if ctx.state.uid != metadata.user_id:
         return
-    ctx.state.uid = metadata.user_id
-    await ctx.redraw(join_prompt_view(metadata.user_id))
+    if data.uid is not None and data.uid != metadata.user_id:
+        return
+    await ctx.redraw(
+        join_prompt_view(metadata.user_id),
+        state=WaitingCodeState(uid=metadata.user_id),
+    )
 
 
 async def join_code(
-    ctx: VKContext,
+    ctx: VKContext[WaitingCodeState],
     metadata: VKMessageMetadata,
     data: None,
     text: str,
 ) -> None:
     if metadata.event_type != "message_new":
+        return
+    if ctx.state.uid != metadata.user_id:
         return
     code = text.strip().upper()
     if not is_valid_code(code):
@@ -467,29 +482,15 @@ async def join_code(
     await draw_game(ctx, metadata, game)
 
 
-async def cancel_join(
-    ctx: VKContext,
-    metadata: VKMessageMetadata,
-    data: CancelJoinInput,
-    text: str,
-) -> None:
-    if data.uid != metadata.user_id:
-        return
-    if ctx.state.uid != metadata.user_id:
-        return
-    await ctx.redraw(None)
-
-
 async def abandon_lobby(
-    ctx: VKContext,
+    ctx: VKContext[LobbyScreenState],
     metadata: VKMessageMetadata,
     data: LobbyActionInput,
     text: str,
 ) -> None:
-    code = ctx.state.code
-    if not code or code != data.code:
+    if ctx.state.uid != metadata.user_id or ctx.state.code != data.code:
         return
-    key = lobby_key(metadata, code)
+    key = lobby_key(metadata, ctx.state.code)
     async with ctx.app.lock(key):
         lobby = await ctx.app.get_state(key, LobbyState)
         if lobby is None or lobby.status != "waiting":
@@ -501,28 +502,23 @@ async def abandon_lobby(
 
 
 async def game_action(
-    ctx: VKContext,
+    ctx: VKContext[GameScreenState],
     metadata: VKMessageMetadata,
     data: MoveInput | SurrenderInput,
     text: str,
 ) -> None:
-    game_id = ctx.state.game_id
-    seat = ctx.state.seat
-    if game_id != data.game_id or seat != data.seat:
+    if ctx.state.game_id != data.game_id or ctx.state.seat != data.seat:
         return
     key = game_key(metadata, data.game_id)
-    async with ctx.app.lock(key):
-        game = await ctx.app.get_state(key, GameState)
+    async with ctx.locked_state(key, GameState, ttl=GAME_TTL) as game:
         if game is None or not apply_game_action(game, data, metadata):
             return
-        await ctx.app.set_state(key, game, ttl=GAME_TTL)
-
         # Рендер под тем же lock'ом сохраняет порядок досок.
         await draw_game(ctx, metadata, game)
 
 
 async def back_to_menu(
-    ctx: VKContext,
+    ctx: VKContext[GameScreenState],
     metadata: VKMessageMetadata,
     data: BackToMenuInput,
     text: str,
@@ -536,21 +532,26 @@ async def back_to_menu(
     player = player_at(game, data.seat)
     if player is None or not is_player(player, metadata):
         return
-    ctx.state = TicTacToeState(uid=metadata.user_id)
-    await ctx.redraw(menu_view(metadata.user_id))
+    await ctx.redraw(
+        menu_view(metadata.user_id),
+        state=MenuState(uid=metadata.user_id),
+    )
 
 
 async def close(
-    ctx: VKContext,
+    ctx: VKContext[ScreenState],
     metadata: VKMessageMetadata,
-    data: CloseInput,
+    data: CloseInput | CancelJoinInput,
     text: str,
 ) -> None:
-    if data.uid != metadata.user_id:
+    if data.uid is not None and data.uid != metadata.user_id:
         return
     if ctx.state.uid != metadata.user_id:
         return
     await ctx.redraw(None)
+
+
+cancel_join = close
 
 
 async def noop(
@@ -568,7 +569,6 @@ def register_handlers(app: App) -> None:
         create_lobby,
         ask_join_code,
         join_code,
-        cancel_join,
         abandon_lobby,
         game_action,
         back_to_menu,
