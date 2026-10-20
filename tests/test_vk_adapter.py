@@ -651,7 +651,12 @@ def test_redraw_replies_to_text_and_replaces_replied_interface() -> None:
         assert sent["message"] == "replacement"
         assert sent["attachment"] == ["photo1_2", "doc3_4"]
         assert sent["keyboard"] is None
-        assert sent["reply_to"] == 44
+        assert json.loads(sent["forward"]) == {
+            "peer_id": 5,
+            "conversation_message_ids": [44],
+            "is_reply": True,
+        }
+        assert "reply_to" not in sent
         assert vk.messages.deletions[-1]["cmids"] == [old.id.cmid]
         assert (
             await app._get_interface_record(
@@ -698,7 +703,7 @@ def test_redraw_without_existing_interface_sends_new_message() -> None:
 
         assert len(vk.messages.sent) == 1
         assert vk.messages.sent[0]["message"] == "new screen"
-        assert vk.messages.sent[0]["reply_to"] is None
+        assert vk.messages.sent[0]["forward"] is None
         assert vk.messages.edits == []
         assert vk.messages.deletions == []
         await app.close()

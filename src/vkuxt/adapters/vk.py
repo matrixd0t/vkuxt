@@ -434,6 +434,18 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         *,
         reply_to: int | None = None,
     ) -> VKMessageInterface:
+        # reply_to удалён начиная с VK API 5.221; ответ передаётся через forward.
+        forward = (
+            _json(
+                {
+                    "peer_id": peer_id,
+                    "conversation_message_ids": [reply_to],
+                    "is_reply": True,
+                }
+            )
+            if reply_to is not None
+            else None
+        )
         response = await self.vk.messages.send(
             peer_ids=[peer_id],
             random_id=secrets.randbelow(2**31),
@@ -441,7 +453,7 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             message=view.text,
             keyboard=prepared.keyboard.to_json() if view.kb else None,
             attachment=view.attachments,
-            reply_to=reply_to,
+            forward=forward,
         )
         try:
             item = response[0][0]
