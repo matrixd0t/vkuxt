@@ -170,6 +170,7 @@ class _VKDispatchContext:
     metadata: VKMessageMetadata
     interface: VKMessageInterface | None
     is_reply: bool
+    from_latest: bool = False
     callback_changed: bool = False
 
 
@@ -373,6 +374,19 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
                 prepared,
                 reply_to=context.metadata._message_cmid,
             )
+            await self.delete(current)
+            return new_interface
+
+        if (
+            same_event
+            and context is not None
+            and context.from_latest
+            and context.metadata.event_type == "message_new"
+            and current is not None
+        ):
+            # Интерфейс подтянут как последний для обычного текста в личке:
+            # считаем его текущим и заменяем после успешной отправки нового.
+            new_interface = await self._send_prepared(recipient, view, prepared)
             await self.delete(current)
             return new_interface
 
@@ -770,11 +784,12 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
             return await super().dispatch_input(event)
         metadata = event.metadata
         is_reply = metadata.event_type == "message_new" and metadata._reply_cmid is not None
-        event = await self._attach_interface(event)
+        event, from_latest = await self._attach_interface(event)
         context = _VKDispatchContext(
             metadata,
             cast(VKMessageInterface | None, event.interface),
             is_reply,
+            from_latest=from_latest,
         )
         context_token = self._vk_event_context.set(context)
         try:
@@ -789,11 +804,12 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
         finally:
             self._vk_event_context.reset(context_token)
 
-    async def _attach_interface(self, event: Input) -> Input:
+    async def _attach_interface(self, event: Input) -> tuple[Input, bool]:
         metadata = event.metadata
         if not isinstance(metadata, VKMessageMetadata) or event.interface is not None:
-            return event
+            return event, False
         interface: VKMessageInterface | None = None
+        from_latest = False
         if metadata.event_type == "message_event":
             if metadata._interface_cmid is not None:
                 interface = await self._handle(
@@ -819,9 +835,10 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
                 interface = await self._handle(candidate)
         elif self.dm_latest_interface and metadata.peer_id == metadata.user_id:
             interface = await self.latest_interface(metadata.peer_id)
+            from_latest = interface is not None
         if interface is None:
-            return event
-        return Input(event.metadata, event.data, event.text, interface=interface)
+            return event, False
+        return Input(event.metadata, event.data, event.text, interface=interface), from_latest
 
     async def _answer_callback_if_needed(
         self,

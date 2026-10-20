@@ -711,6 +711,64 @@ def test_redraw_without_existing_interface_sends_new_message() -> None:
     asyncio.run(scenario())
 
 
+def test_redraw_replaces_latest_interface_attached_to_plain_dm_text() -> None:
+    async def scenario() -> None:
+        app = App(MemoryStorage())
+        vk = FakeVK()
+        adapter = add_vk_adapter(app, vk)
+        old = await adapter.send(5, VKInterface(text="prompt"))
+
+        @app.handler(background=False)
+        async def advance(
+            ctx: Context,
+            metadata: VKMessageMetadata,
+            data: InputData | None,
+            text: str,
+        ) -> None:
+            assert ctx.interface is not None
+            assert ctx.interface.id == old.id
+            await ctx.redraw(VKInterface(text="replacement"))
+
+        metadata = VKMessageMetadata(
+            event_type="message_new",
+            group_id=71,
+            peer_id=5,
+            user_id=5,
+        )
+        metadata._message_cmid = 44
+        await adapter.dispatch_input(Input(metadata, text="13"))
+
+        sent = vk.messages.sent[-1]
+        assert sent["message"] == "replacement"
+        assert sent["forward"] is None
+        assert vk.messages.deletions[-1]["cmids"] == [old.id.cmid]
+        assert (
+            await app._get_interface_record(
+                old.id,
+                platform=adapter.platform,
+            )
+            is None
+        )
+        new_id = VKMessageInterfaceId(cmid=92, peer_id=5, group_id=71)
+        assert (
+            await app._get_interface_record(
+                new_id,
+                platform=adapter.platform,
+            )
+            is not None
+        )
+        assert await app.get_state(old.state_key()) is None
+        assert (
+            await app.get_state(
+                VKMessageInterface(new_id, platform=adapter.platform).state_key()
+            )
+            is not None
+        )
+        await app.close()
+
+    asyncio.run(scenario())
+
+
 def test_redraw_targets_a_concrete_interface_and_returns_handle() -> None:
     async def scenario() -> None:
         app = App(MemoryStorage())
