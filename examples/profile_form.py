@@ -1,9 +1,9 @@
 """Анкета: пошаговое заполнение формы в диалоге VK.
 
-Пользователь присылает текстовые значения ответом на сообщение-подсказку,
-опыт работы выбирает кнопками. Шаг и введённые значения живут в ``ctx.state``
-текущего интерфейса, готовая анкета сохраняется в storage приложения. Через
-меню можно посмотреть сохранённую анкету или заполнить её заново.
+Экранные состояния объявлены отдельными моделями: хендлеры получают только
+события своего шага, а переходы выполняются через ``ctx.redraw(view, state=...)``.
+Готовая анкета обновляется атомарно через ``ctx.locked_state`` и переживает
+перезапуск приложения.
 """
 
 from __future__ import annotations
@@ -29,18 +29,8 @@ from vkuxt import (
 FORM_TTL = 30 * 60
 MIN_AGE = 14
 MAX_AGE = 120
-START_WORDS = frozenset({"/form", "анкета", "форма"})
+START_WORDS = frozenset({"/form", "/start", "анкета", "форма", "начать", "заполнить"})
 
-type FormStep = Literal[
-    "idle",
-    "name",
-    "age",
-    "experience",
-    "city",
-    "confirm",
-    "done",
-    "profile",
-]
 type Experience = Literal["none", "junior", "middle", "senior"]
 
 EXPERIENCE_LABELS: dict[Experience, str] = {
@@ -50,23 +40,13 @@ EXPERIENCE_LABELS: dict[Experience, str] = {
     "senior": "Более 3 лет",
 }
 
-_STEPS: tuple[FormStep, ...] = ("name", "age", "experience", "city", "confirm")
-_PREVIOUS_STEP: dict[FormStep, FormStep] = {
-    "age": "name",
-    "experience": "age",
-    "city": "experience",
-    "confirm": "city",
+_STEP_NUMBERS: dict[str, int] = {
+    "name": 1,
+    "age": 2,
+    "experience": 3,
+    "city": 4,
+    "confirm": 5,
 }
-
-
-class FormState(StateNamespace):
-    step: FormStep = "idle"
-    uid: int = 0
-    name: str = ""
-    age: int = 0
-    experience: Experience | None = None
-    city: str = ""
-    error: str = ""
 
 
 class Profile(BaseModel):
@@ -74,9 +54,70 @@ class Profile(BaseModel):
     age: int
     experience: Experience
     city: str
+    revision: int = 0
 
 
-type FormContext = Context[VKMessagesCallbackAdapter, FormState]
+class FormState(StateNamespace):
+    uid: int
+    name: str = ""
+    age: int = 0
+    experience: Experience | None = None
+    city: str = ""
+    error: str = ""
+
+
+class MenuState(FormState):
+    phase: Literal["menu"] = "menu"
+
+
+class NameState(FormState):
+    phase: Literal["name"] = "name"
+
+
+class AgeState(FormState):
+    phase: Literal["age"] = "age"
+    name: str
+
+
+class ExperienceState(FormState):
+    phase: Literal["experience"] = "experience"
+    name: str
+    age: int
+
+
+class CityState(FormState):
+    phase: Literal["city"] = "city"
+    name: str
+    age: int
+    experience: Experience
+
+
+class ConfirmState(FormState):
+    phase: Literal["confirm"] = "confirm"
+    name: str
+    age: int
+    experience: Experience
+    city: str
+
+
+class DoneState(FormState):
+    phase: Literal["done"] = "done"
+    name: str
+    age: int
+    experience: Experience
+    city: str
+
+
+class ProfileState(FormState):
+    phase: Literal["profile"] = "profile"
+
+
+type FormContext[StateT: StateNamespace | None = StateNamespace] = Context[
+    VKMessagesCallbackAdapter,
+    StateT,
+]
+type MenuLikeState = MenuState | DoneState | ProfileState
+type BackState = AgeState | ExperienceState | CityState | ConfirmState
 
 
 class FormInput(InputData):
@@ -106,6 +147,10 @@ class ExperienceInput(FormInput):
 
 class ViewProfileInput(FormInput):
     handler_name: Literal["form.view"] = "form.view"
+
+
+def is_start(text: str) -> bool:
+    return " ".join(text.split()).casefold() in START_WORDS
 
 
 def normalize_name(raw: str) -> str | None:
@@ -149,31 +194,12 @@ def profile_key(metadata: VKMessageMetadata) -> dict[str, int | str]:
     }
 
 
-def is_owner(state: FormState, metadata: VKMessageMetadata) -> bool:
-    return state.uid == metadata.user_id
+def progress(phase: str) -> str:
+    return f"Шаг {_STEP_NUMBERS[phase]} из {len(_STEP_NUMBERS)}"
 
 
-def progress(step: FormStep) -> str:
-    return f"Шаг {_STEPS.index(step) + 1} из {len(_STEPS)}"
-
-
-def prompt_for(step: FormStep) -> str:
-    match step:
-        case "name":
-            return "Как вас зовут? Напишите имя ответом на это сообщение."
-        case "age":
-            return (
-                f"Сколько вам лет? Напишите число от {MIN_AGE} до {MAX_AGE} "
-                "ответом на это сообщение."
-            )
-        case "city":
-            return "В каком городе вы живёте? Напишите город ответом на это сообщение."
-        case _:
-            return ""
-
-
-def experience_label(value: Experience | None) -> str:
-    return "не выбрано" if value is None else EXPERIENCE_LABELS[value]
+def progress_lines(step: str, prompt: str) -> list[str]:
+    return [progress(step), "", prompt]
 
 
 def filled_lines(state: FormState) -> list[str]:
@@ -215,7 +241,7 @@ def with_error(lines: list[str], error: str) -> str:
     return "\n".join(lines)
 
 
-def menu_view(state: FormState, profile: Profile | None) -> VKInterface:
+def menu_view(uid: int, profile: Profile | None) -> VKInterface:
     lines = ["Анкета", ""]
     if profile is None:
         lines.append("Сохранённой анкеты пока нет.")
@@ -229,79 +255,107 @@ def menu_view(state: FormState, profile: Profile | None) -> VKInterface:
         actions.append(
             VKInterface.callback(
                 "Моя анкета",
-                ViewProfileInput(uid=state.uid),
+                ViewProfileInput(uid=uid),
                 color=KeyboardButtonColor.PRIMARY,
             )
         )
     actions.append(
         VKInterface.callback(
             "Заполнить заново" if profile is not None else "Заполнить анкету",
-            StartInput(uid=state.uid),
+            StartInput(uid=uid),
             color=KeyboardButtonColor.POSITIVE,
         )
     )
-    rows = [
-        actions,
-        [
-            VKInterface.callback(
-                "Закрыть",
-                CancelInput(uid=state.uid),
-                color=KeyboardButtonColor.NEGATIVE,
-            )
-        ],
-    ]
-    return VKInterface(text="\n".join(lines), kb=rows, ttl=FORM_TTL)
-
-
-def saved_view(profile: Profile, uid: int) -> VKInterface:
-    lines = ["Ваша анкета", "", *profile_lines(profile)]
-    rows = [
-        [
-            VKInterface.callback(
-                "Заполнить заново",
-                StartInput(uid=uid),
-                color=KeyboardButtonColor.POSITIVE,
-            ),
-            VKInterface.callback(
-                "Закрыть",
-                CancelInput(uid=uid),
-                color=KeyboardButtonColor.NEGATIVE,
-            ),
-        ]
-    ]
-    return VKInterface(text="\n".join(lines), kb=rows, ttl=FORM_TTL)
-
-
-def prompt_view(state: FormState) -> VKInterface:
-    lines = [progress(state.step), "", prompt_for(state.step)]
-    values = filled_lines(state)
-    if values:
-        lines.extend(["", *values])
-    buttons = [
-        VKInterface.callback(
-            "Отмена",
-            CancelInput(uid=state.uid),
-            color=KeyboardButtonColor.NEGATIVE,
-        )
-    ]
-    previous = _PREVIOUS_STEP.get(state.step)
-    if previous is not None:
-        buttons.insert(
-            0,
-            VKInterface.callback(
-                "Назад",
-                BackInput(uid=state.uid),
-                color=KeyboardButtonColor.PRIMARY,
-            ),
-        )
     return VKInterface(
-        text=with_error(lines, state.error),
-        kb=[buttons],
+        text="\n".join(lines),
+        kb=[
+            actions,
+            [
+                VKInterface.callback(
+                    "Закрыть",
+                    CancelInput(uid=uid),
+                    color=KeyboardButtonColor.NEGATIVE,
+                )
+            ],
+        ],
         ttl=FORM_TTL,
     )
 
 
-def experience_button(state: FormState, value: Experience) -> KeyboardButton:
+def saved_view(profile: Profile, uid: int) -> VKInterface:
+    return VKInterface(
+        text="\n".join(["Ваша анкета", "", *profile_lines(profile)]),
+        kb=[
+            [
+                VKInterface.callback(
+                    "Заполнить заново",
+                    StartInput(uid=uid),
+                    color=KeyboardButtonColor.POSITIVE,
+                ),
+                VKInterface.callback(
+                    "Закрыть",
+                    CancelInput(uid=uid),
+                    color=KeyboardButtonColor.NEGATIVE,
+                ),
+            ]
+        ],
+        ttl=FORM_TTL,
+    )
+
+
+def name_view(state: NameState) -> VKInterface:
+    lines = progress_lines(
+        "name",
+        "Как вас зовут? Напишите имя ответом на это сообщение.",
+    )
+    values = filled_lines(state)
+    if values:
+        lines.extend(["", *values])
+    return VKInterface(
+        text=with_error(lines, state.error),
+        kb=[
+            [
+                VKInterface.callback(
+                    "Отмена",
+                    CancelInput(uid=state.uid),
+                    color=KeyboardButtonColor.NEGATIVE,
+                )
+            ]
+        ],
+        ttl=FORM_TTL,
+    )
+
+
+def age_view(state: AgeState) -> VKInterface:
+    lines = progress_lines(
+        "age",
+        f"Сколько вам лет? Напишите число от {MIN_AGE} до {MAX_AGE} "
+        "ответом на это сообщение.",
+    )
+    values = filled_lines(state)
+    if values:
+        lines.extend(["", *values])
+    return VKInterface(
+        text=with_error(lines, state.error),
+        kb=[
+            [
+                VKInterface.callback(
+                    "Назад",
+                    BackInput(uid=state.uid),
+                    color=KeyboardButtonColor.PRIMARY,
+                ),
+                VKInterface.callback(
+                    "Отмена",
+                    CancelInput(uid=state.uid),
+                    color=KeyboardButtonColor.NEGATIVE,
+                ),
+            ]
+        ],
+        ttl=FORM_TTL,
+    )
+
+
+def experience_button(state: ExperienceState, value: Experience) -> KeyboardButton:
     return VKInterface.callback(
         EXPERIENCE_LABELS[value],
         ExperienceInput(uid=state.uid, value=value),
@@ -313,35 +367,62 @@ def experience_button(state: FormState, value: Experience) -> KeyboardButton:
     )
 
 
-def experience_view(state: FormState) -> VKInterface:
-    lines = [progress("experience"), "", "Выберите опыт работы:"]
+def experience_view(state: ExperienceState) -> VKInterface:
+    lines = progress_lines("experience", "Выберите опыт работы:")
     values = filled_lines(state)
     if values:
         lines.extend(["", *values])
-    rows = [
-        [experience_button(state, "none"), experience_button(state, "junior")],
-        [experience_button(state, "middle"), experience_button(state, "senior")],
-        [
-            VKInterface.callback(
-                "Назад",
-                BackInput(uid=state.uid),
-                color=KeyboardButtonColor.PRIMARY,
-            ),
-            VKInterface.callback(
-                "Отмена",
-                CancelInput(uid=state.uid),
-                color=KeyboardButtonColor.NEGATIVE,
-            ),
-        ],
-    ]
     return VKInterface(
         text=with_error(lines, state.error),
-        kb=rows,
+        kb=[
+            [experience_button(state, "none"), experience_button(state, "junior")],
+            [experience_button(state, "middle"), experience_button(state, "senior")],
+            [
+                VKInterface.callback(
+                    "Назад",
+                    BackInput(uid=state.uid),
+                    color=KeyboardButtonColor.PRIMARY,
+                ),
+                VKInterface.callback(
+                    "Отмена",
+                    CancelInput(uid=state.uid),
+                    color=KeyboardButtonColor.NEGATIVE,
+                ),
+            ],
+        ],
         ttl=FORM_TTL,
     )
 
 
-def confirm_view(state: FormState) -> VKInterface:
+def city_view(state: CityState) -> VKInterface:
+    lines = progress_lines(
+        "city",
+        "В каком городе вы живёте? Напишите город ответом на это сообщение.",
+    )
+    values = filled_lines(state)
+    if values:
+        lines.extend(["", *values])
+    return VKInterface(
+        text=with_error(lines, state.error),
+        kb=[
+            [
+                VKInterface.callback(
+                    "Назад",
+                    BackInput(uid=state.uid),
+                    color=KeyboardButtonColor.PRIMARY,
+                ),
+                VKInterface.callback(
+                    "Отмена",
+                    CancelInput(uid=state.uid),
+                    color=KeyboardButtonColor.NEGATIVE,
+                ),
+            ]
+        ],
+        ttl=FORM_TTL,
+    )
+
+
+def confirm_view(state: ConfirmState) -> VKInterface:
     lines = [
         progress("confirm"),
         "",
@@ -349,232 +430,321 @@ def confirm_view(state: FormState) -> VKInterface:
         "",
         f"Имя: {state.name}",
         f"Возраст: {state.age}",
-        f"Опыт: {experience_label(state.experience)}",
+        f"Опыт: {EXPERIENCE_LABELS[state.experience]}",
         f"Город: {state.city}",
-    ]
-    buttons = [
-        VKInterface.callback(
-            "Отправить",
-            SubmitInput(uid=state.uid),
-            color=KeyboardButtonColor.POSITIVE,
-        ),
-        VKInterface.callback(
-            "Назад",
-            BackInput(uid=state.uid),
-            color=KeyboardButtonColor.PRIMARY,
-        ),
-        VKInterface.callback(
-            "Отмена",
-            CancelInput(uid=state.uid),
-            color=KeyboardButtonColor.NEGATIVE,
-        ),
     ]
     return VKInterface(
         text=with_error(lines, state.error),
-        kb=[buttons],
+        kb=[
+            [
+                VKInterface.callback(
+                    "Отправить",
+                    SubmitInput(uid=state.uid),
+                    color=KeyboardButtonColor.POSITIVE,
+                ),
+                VKInterface.callback(
+                    "Назад",
+                    BackInput(uid=state.uid),
+                    color=KeyboardButtonColor.PRIMARY,
+                ),
+                VKInterface.callback(
+                    "Отмена",
+                    CancelInput(uid=state.uid),
+                    color=KeyboardButtonColor.NEGATIVE,
+                ),
+            ]
+        ],
         ttl=FORM_TTL,
     )
 
 
-def done_view(state: FormState) -> VKInterface:
+def done_view(state: DoneState) -> VKInterface:
     profile = profile_from_state(state)
     lines = ["Анкета сохранена.", ""]
     if profile is not None:
         lines.extend(profile_lines(profile))
-    rows = [
-        [
-            VKInterface.callback(
-                "Заполнить заново",
-                StartInput(uid=state.uid),
-                color=KeyboardButtonColor.POSITIVE,
-            ),
-            VKInterface.callback(
-                "Закрыть",
-                CancelInput(uid=state.uid),
-                color=KeyboardButtonColor.NEGATIVE,
-            ),
-        ]
-    ]
-    return VKInterface(text="\n".join(lines), kb=rows, ttl=FORM_TTL)
+    return VKInterface(
+        text="\n".join(lines),
+        kb=[
+            [
+                VKInterface.callback(
+                    "Заполнить заново",
+                    StartInput(uid=state.uid),
+                    color=KeyboardButtonColor.POSITIVE,
+                ),
+                VKInterface.callback(
+                    "Закрыть",
+                    CancelInput(uid=state.uid),
+                    color=KeyboardButtonColor.NEGATIVE,
+                ),
+            ]
+        ],
+        ttl=FORM_TTL,
+    )
 
 
-def active_view(state: FormState) -> VKInterface:
-    if state.step == "experience":
-        return experience_view(state)
-    if state.step == "confirm":
-        return confirm_view(state)
-    if state.step == "done":
-        return done_view(state)
-    return prompt_view(state)
-
-
-async def form_text(
-    ctx: FormContext,
+async def start_from_empty(
+    ctx: FormContext[None],
     metadata: VKMessageMetadata,
     data: None,
     text: str,
 ) -> None:
-    """Принять текст: команду запуска или значение текущего шага."""
-    if metadata.event_type != "message_new":
+    """Начать с пустого состояния: у пользователя ещё нет экрана."""
+    if metadata.event_type != "message_new" or not is_start(text):
         return
-    value = " ".join(text.split())
-    if not value:
-        return
-
-    state = ctx.state
-    if state.step == "idle":
-        if value.casefold() in START_WORDS:
-            profile = await ctx.app.get_state(profile_key(metadata), Profile)
-            ctx.state = FormState(step="idle", uid=metadata.user_id)
-            await ctx.redraw(menu_view(ctx.state, profile))
-        return
-    if not is_owner(state, metadata):
-        return
-    if state.step in {"done", "profile"}:
-        if value.casefold() in START_WORDS:
-            profile = await ctx.app.get_state(profile_key(metadata), Profile)
-            ctx.state = FormState(step="idle", uid=metadata.user_id)
-            await ctx.redraw(menu_view(ctx.state, profile))
-        return
-    if state.step == "confirm":
-        state.error = "Проверьте данные и нажмите «Отправить»."
-        await ctx.redraw(confirm_view(state))
-        return
-    if state.step == "experience":
-        state.error = "Выберите опыт работы кнопкой."
-        await ctx.redraw(experience_view(state))
-        return
-
-    match state.step:
-        case "name":
-            name = normalize_name(value)
-            if name is None:
-                state.error = "Имя — от 2 до 40 букв, пробелов или дефисов."
-                await ctx.redraw(prompt_view(state))
-                return
-            state.name = name
-            state.error = ""
-            state.step = "age"
-            await ctx.redraw(prompt_view(state))
-        case "age":
-            age = parse_age(value)
-            if age is None:
-                state.error = f"Возраст — целое число от {MIN_AGE} до {MAX_AGE}."
-                await ctx.redraw(prompt_view(state))
-                return
-            state.age = age
-            state.error = ""
-            state.step = "experience"
-            await ctx.redraw(experience_view(state))
-        case "city":
-            city = normalize_city(value)
-            if city is None:
-                state.error = "Город — от 2 до 60 букв, пробелов, дефисов или точек."
-                await ctx.redraw(prompt_view(state))
-                return
-            state.city = city
-            state.error = ""
-            state.step = "confirm"
-            await ctx.redraw(confirm_view(state))
+    profile = await ctx.app.get_state(profile_key(metadata), Profile)
+    state = MenuState(uid=metadata.user_id)
+    await ctx.redraw(menu_view(metadata.user_id, profile), state=state)
 
 
-async def start(
-    ctx: FormContext,
+async def open_menu(
+    ctx: FormContext[MenuLikeState],
+    metadata: VKMessageMetadata,
+    data: None,
+    text: str,
+) -> None:
+    if metadata.event_type != "message_new" or not is_start(text):
+        return
+    if ctx.state.uid != metadata.user_id:
+        return
+    profile = await ctx.app.get_state(profile_key(metadata), Profile)
+    state = MenuState(uid=metadata.user_id)
+    await ctx.redraw(menu_view(metadata.user_id, profile), state=state)
+
+
+async def begin_form(
+    ctx: FormContext[MenuLikeState],
     metadata: VKMessageMetadata,
     data: StartInput,
     text: str,
 ) -> None:
-    if data.uid != metadata.user_id:
+    if data.uid != metadata.user_id or ctx.state.uid != metadata.user_id:
         return
-    ctx.state = FormState(step="name", uid=metadata.user_id)
-    await ctx.redraw(prompt_view(ctx.state))
+    state = NameState(uid=metadata.user_id)
+    await ctx.redraw(name_view(state), state=state)
+
+
+async def enter_name(
+    ctx: FormContext[NameState],
+    metadata: VKMessageMetadata,
+    data: None,
+    text: str,
+) -> None:
+    if metadata.event_type != "message_new":
+        return
+    if ctx.state.uid != metadata.user_id:
+        return
+    name = normalize_name(text)
+    if name is None:
+        ctx.state.error = "Имя — от 2 до 40 букв, пробелов или дефисов."
+        await ctx.redraw(name_view(ctx.state))
+        return
+    state = AgeState(uid=ctx.state.uid, name=name)
+    await ctx.redraw(age_view(state), state=state)
+
+
+async def enter_age(
+    ctx: FormContext[AgeState],
+    metadata: VKMessageMetadata,
+    data: None,
+    text: str,
+) -> None:
+    if metadata.event_type != "message_new":
+        return
+    if ctx.state.uid != metadata.user_id:
+        return
+    age = parse_age(text)
+    if age is None:
+        ctx.state.error = f"Возраст — целое число от {MIN_AGE} до {MAX_AGE}."
+        await ctx.redraw(age_view(ctx.state))
+        return
+    state = ExperienceState(uid=ctx.state.uid, name=ctx.state.name, age=age)
+    await ctx.redraw(experience_view(state), state=state)
+
+
+async def experience_text(
+    ctx: FormContext[ExperienceState],
+    metadata: VKMessageMetadata,
+    data: None,
+    text: str,
+) -> None:
+    if metadata.event_type != "message_new":
+        return
+    if ctx.state.uid != metadata.user_id:
+        return
+    ctx.state.error = "Выберите опыт работы кнопкой."
+    await ctx.redraw(experience_view(ctx.state))
 
 
 async def choose_experience(
-    ctx: FormContext,
+    ctx: FormContext[ExperienceState],
     metadata: VKMessageMetadata,
     data: ExperienceInput,
     text: str,
 ) -> None:
-    state = ctx.state
-    if data.uid != metadata.user_id or not is_owner(state, metadata):
+    if data.uid != metadata.user_id or ctx.state.uid != metadata.user_id:
         return
-    if state.step != "experience":
-        return
-    state.experience = data.value
-    state.error = ""
-    state.step = "city"
-    await ctx.redraw(prompt_view(state))
+    state = CityState(
+        uid=ctx.state.uid,
+        name=ctx.state.name,
+        age=ctx.state.age,
+        experience=data.value,
+    )
+    await ctx.redraw(city_view(state), state=state)
 
 
-async def show_profile(
-    ctx: FormContext,
+async def enter_city(
+    ctx: FormContext[CityState],
     metadata: VKMessageMetadata,
-    data: ViewProfileInput,
+    data: None,
     text: str,
 ) -> None:
-    state = ctx.state
-    if data.uid != metadata.user_id or not is_owner(state, metadata):
+    if metadata.event_type != "message_new":
         return
-    profile = await ctx.app.get_state(profile_key(metadata), Profile)
-    if profile is None:
-        state.step = "idle"
-        state.error = ""
-        await ctx.redraw(menu_view(state, None))
+    if ctx.state.uid != metadata.user_id:
         return
-    state.step = "profile"
-    state.error = ""
-    await ctx.redraw(saved_view(profile, state.uid))
+    city = normalize_city(text)
+    if city is None:
+        ctx.state.error = "Город — от 2 до 60 букв, пробелов, дефисов или точек."
+        await ctx.redraw(city_view(ctx.state))
+        return
+    state = ConfirmState(
+        uid=ctx.state.uid,
+        name=ctx.state.name,
+        age=ctx.state.age,
+        experience=ctx.state.experience,
+        city=city,
+    )
+    await ctx.redraw(confirm_view(state), state=state)
+
+
+async def confirm_text(
+    ctx: FormContext[ConfirmState],
+    metadata: VKMessageMetadata,
+    data: None,
+    text: str,
+) -> None:
+    if metadata.event_type != "message_new":
+        return
+    if ctx.state.uid != metadata.user_id:
+        return
+    ctx.state.error = "Проверьте данные и нажмите «Отправить»."
+    await ctx.redraw(confirm_view(ctx.state))
 
 
 async def go_back(
-    ctx: FormContext,
+    ctx: FormContext[BackState],
     metadata: VKMessageMetadata,
     data: BackInput,
     text: str,
 ) -> None:
     state = ctx.state
-    if data.uid != metadata.user_id or not is_owner(state, metadata):
+    if data.uid != metadata.user_id or state.uid != metadata.user_id:
         return
-    previous = _PREVIOUS_STEP.get(state.step)
-    if previous is None:
+    if isinstance(state, AgeState):
+        target = NameState(uid=state.uid, name=state.name)
+        await ctx.redraw(name_view(target), state=target)
+    elif isinstance(state, ExperienceState):
+        target = AgeState(uid=state.uid, name=state.name, age=state.age)
+        await ctx.redraw(age_view(target), state=target)
+    elif isinstance(state, CityState):
+        target = ExperienceState(
+            uid=state.uid,
+            name=state.name,
+            age=state.age,
+            experience=state.experience,
+        )
+        await ctx.redraw(experience_view(target), state=target)
+    else:
+        target = CityState(
+            uid=state.uid,
+            name=state.name,
+            age=state.age,
+            experience=state.experience,
+            city=state.city,
+        )
+        await ctx.redraw(city_view(target), state=target)
+
+
+async def show_profile(
+    ctx: FormContext[MenuState],
+    metadata: VKMessageMetadata,
+    data: ViewProfileInput,
+    text: str,
+) -> None:
+    if data.uid != metadata.user_id or ctx.state.uid != metadata.user_id:
         return
-    state.step = previous
-    state.error = ""
-    await ctx.redraw(active_view(state))
+    profile = await ctx.app.get_state(profile_key(metadata), Profile)
+    if profile is None:
+        state = MenuState(uid=metadata.user_id)
+        await ctx.redraw(menu_view(metadata.user_id, None), state=state)
+        return
+    state = ProfileState(uid=metadata.user_id)
+    await ctx.redraw(saved_view(profile, metadata.user_id), state=state)
 
 
 async def submit(
-    ctx: FormContext,
+    ctx: FormContext[ConfirmState],
     metadata: VKMessageMetadata,
     data: SubmitInput,
     text: str,
 ) -> None:
     state = ctx.state
-    if data.uid != metadata.user_id or not is_owner(state, metadata):
+    if data.uid != metadata.user_id or state.uid != metadata.user_id:
         return
-    profile = profile_from_state(state)
-    if state.step != "confirm" or profile is None:
-        return
-    await ctx.app.set_state(profile_key(metadata), profile)
-    state.step = "done"
-    state.error = ""
-    await ctx.redraw(done_view(state))
+    profile = Profile(
+        name=state.name,
+        age=state.age,
+        experience=state.experience,
+        city=state.city,
+    )
+    async with ctx.locked_state(
+        profile_key(metadata),
+        Profile,
+        default=profile,
+    ) as saved:
+        saved.name = state.name
+        saved.age = state.age
+        saved.experience = state.experience
+        saved.city = state.city
+        saved.revision += 1
+    done = DoneState(
+        uid=state.uid,
+        name=state.name,
+        age=state.age,
+        experience=state.experience,
+        city=state.city,
+    )
+    await ctx.redraw(done_view(done), state=done)
 
 
 async def cancel(
-    ctx: FormContext,
+    ctx: FormContext[FormState],
     metadata: VKMessageMetadata,
     data: CancelInput,
     text: str,
 ) -> None:
-    if data.uid != metadata.user_id:
+    if data.uid != metadata.user_id or ctx.state.uid != metadata.user_id:
         return
     await ctx.redraw(None)
 
 
 def register_handlers(app: App) -> None:
-    for handler in (form_text, start, choose_experience, show_profile, go_back, submit, cancel):
+    for handler in (
+        start_from_empty,
+        open_menu,
+        begin_form,
+        enter_name,
+        enter_age,
+        experience_text,
+        choose_experience,
+        enter_city,
+        confirm_text,
+        go_back,
+        show_profile,
+        submit,
+        cancel,
+    ):
         app.add_handler(handler)
 
 
@@ -583,9 +753,17 @@ def build_app(
     group_id: int,
     *,
     storage_path: str = "profile-form-state.json",
+    dm_latest_interface: bool = True,
 ) -> App:
     """Собрать приложение; HTTP-обвязка — как в examples/tictactoe.py."""
     app = App(JSONFileStorage(storage_path))
-    app.add_adapter(VKMessagesCallbackAdapter(app, vk, group_id))
+    app.add_adapter(
+        VKMessagesCallbackAdapter(
+            app,
+            vk,
+            group_id,
+            dm_latest_interface=dm_latest_interface,
+        )
+    )
     register_handlers(app)
     return app
