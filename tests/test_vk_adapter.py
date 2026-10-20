@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from inspect import isabstract
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
@@ -107,6 +108,39 @@ def test_send_registers_the_vk_external_mount_id() -> None:
             is not None
         )
         assert vk.messages.sent[0]["peer_ids"] == [interface.id.peer_id]
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_delete_treats_already_deleted_message_as_success() -> None:
+    class MissingMessages(FakeMessages):
+        async def delete(self, **kwargs) -> list[SimpleNamespace]:
+            self.deletions.append(kwargs)
+            return [
+                SimpleNamespace(
+                    response=None,
+                    error=SimpleNamespace(code=15),
+                )
+            ]
+
+    async def scenario() -> None:
+        app = App(MemoryStorage())
+        vk = FakeVK()
+        vk.messages = MissingMessages()
+        adapter = add_vk_adapter(app, vk)
+        interface = await adapter.send(5, VKInterface(text="prompt"))
+
+        assert await adapter.delete(interface) is True
+        assert interface.deleted is True
+        assert (
+            await app._get_interface_record(
+                interface.id,
+                platform=adapter.platform,
+            )
+            is None
+        )
+        assert await app.get_state(interface.state_key()) is None
         await app.close()
 
     asyncio.run(scenario())

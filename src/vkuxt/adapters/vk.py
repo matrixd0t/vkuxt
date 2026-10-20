@@ -962,7 +962,9 @@ def _delete_succeeded(response: Any) -> bool:
     if isinstance(response, bool):
         return response
     if isinstance(response, Mapping):
-        return bool(response.get("response"))
+        return bool(response.get("response")) or _delete_error_is_missing(
+            response.get("error")
+        )
     if isinstance(response, (list, tuple)):
         return bool(response) and all(_delete_item_succeeded(item) for item in response)
     return _delete_item_succeeded(response)
@@ -972,10 +974,21 @@ def _delete_item_succeeded(item: Any) -> bool:
     if isinstance(item, bool):
         return item
     if isinstance(item, Mapping):
-        return bool(item.get("response"))
+        return bool(item.get("response")) or _delete_error_is_missing(
+            item.get("error")
+        )
     if hasattr(item, "response"):
-        return bool(item.response)
+        return bool(item.response) or _delete_error_is_missing(
+            getattr(item, "error", None)
+        )
     return bool(item)
+
+
+def _delete_error_is_missing(error: Any) -> bool:
+    """VK отвечает кодом 15, если сообщение уже удалено."""
+    if isinstance(error, Mapping):
+        return error.get("code") == 15
+    return getattr(error, "code", None) == 15
 
 
 def _event_type(event: Any) -> str:
