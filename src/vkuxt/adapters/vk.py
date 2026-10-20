@@ -91,7 +91,9 @@ class VKInterface(Interface[KeyboardButton]):
     attachments: AttachmentsInput | None = None
 
     def validate(self) -> None:
-        super().validate()
+        # Не super(): dataclass(slots=True) пересоздаёт класс, и zero-arg
+        # super() ломается на Python 3.13.5.
+        Interface.validate(self)
         if len(self.text) > _VK_TEXT_LIMIT:
             raise ValueError(
                 f"текст VK-интерфейса не должен превышать {_VK_TEXT_LIMIT} символов"
