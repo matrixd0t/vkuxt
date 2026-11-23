@@ -216,7 +216,11 @@ class _VKAdapterBase(Adapter, ABC):
             platform=self.platform,
         )
         if record is None:
-            return VKMessageInterface(interface_id, platform=self.platform)
+            # Запись истекла или уже удалена: исходный TTL неизвестен,
+            # используем дефолт приложения, как при новой регистрации.
+            return VKMessageInterface(
+                interface_id, platform=self.platform, ttl=self.app.ttl
+            )
         return VKMessageInterface(
             interface_id,
             dict(record.actions),
@@ -334,7 +338,6 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         validated_state = _coerce_interface_state(state) if state is not None else None
         view = interface
         context = self._vk_event_context.get()
-        explicit_target = target is not None
         if target is not None:
             current = target
             recipient = target.id.peer_id
@@ -362,15 +365,6 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             if current is not None and not await self.delete(current):
                 raise RuntimeError("Не удалось удалить VK-интерфейс")
             return None
-
-        if (
-            not explicit_target
-            and same_event
-            and context is not None
-            and context.metadata.event_type == "message_new"
-            and not context.is_reply
-        ):
-            current = None
 
         prepared = self._prepare_view(view)
         result: VKMessageInterface | None = None

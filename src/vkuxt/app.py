@@ -475,13 +475,6 @@ class App:
                 initial_state_cache,
             ):
                 continue
-            if not await self._matches_state(
-                adapter,
-                _input,
-                entry,
-                state_cache,
-            ):
-                continue
             background_entries.append((entry, data))
         if background_entries:
             task = asyncio.create_task(

@@ -1008,3 +1008,88 @@ def test_send_and_redraw_persist_passed_state() -> None:
         await app.close()
 
     asyncio.run(scenario())
+
+
+def test_redraw_via_adapter_replaces_latest_for_plain_text() -> None:
+    # adapter.redraw без target (и с peer_id) должен вести себя как
+    # ctx.redraw для обычного текста в личке, где интерфейс подтянут
+    # как последний: новое сообщение отправляется, прежнее удаляется.
+    async def scenario_without_target() -> None:
+        app = App(MemoryStorage())
+        vk = FakeVK()
+        adapter = add_vk_adapter(app, vk)
+        old = await adapter.send(5, VKInterface(text="prompt"))
+
+        @app.handler(background=False)
+        async def advance(
+            ctx: Context,
+            metadata: VKMessageMetadata,
+            data: InputData | None,
+            text: str,
+        ) -> None:
+            await ctx.adapter.redraw(VKInterface(text="replacement"))
+
+        metadata = VKMessageMetadata(
+            event_type="message_new",
+            group_id=71,
+            peer_id=5,
+            user_id=5,
+        )
+        metadata._message_cmid = 44
+        await adapter.dispatch_input(Input(metadata, text="13"))
+
+        assert vk.messages.sent[-1]["message"] == "replacement"
+        assert vk.messages.deletions[-1]["cmids"] == [old.id.cmid]
+        assert (
+            await app._get_interface_record(old.id, platform=adapter.platform)
+            is None
+        )
+        await app.close()
+
+    async def scenario_via_peer_id() -> None:
+        app = App(MemoryStorage())
+        vk = FakeVK()
+        adapter = add_vk_adapter(app, vk)
+        old = await adapter.send(5, VKInterface(text="prompt"))
+
+        @app.handler(background=False)
+        async def advance(
+            ctx: Context,
+            metadata: VKMessageMetadata,
+            data: InputData | None,
+            text: str,
+        ) -> None:
+            await ctx.adapter.redraw(VKInterface(text="replacement"), peer_id=5)
+
+        metadata = VKMessageMetadata(
+            event_type="message_new",
+            group_id=71,
+            peer_id=5,
+            user_id=5,
+        )
+        metadata._message_cmid = 44
+        await adapter.dispatch_input(Input(metadata, text="13"))
+
+        assert vk.messages.sent[-1]["message"] == "replacement"
+        assert vk.messages.deletions[-1]["cmids"] == [old.id.cmid]
+        assert (
+            await app._get_interface_record(old.id, platform=adapter.platform)
+            is None
+        )
+        await app.close()
+
+    asyncio.run(scenario_without_target())
+    asyncio.run(scenario_via_peer_id())
+
+
+def test_missing_interface_handle_uses_app_default_ttl() -> None:
+    async def scenario() -> None:
+        app = App(MemoryStorage(), ttl=3600)
+        adapter = add_vk_adapter(app, FakeVK())
+        interface = await adapter.send(5, VKInterface(text="prompt", ttl=120))
+        await app._remove_interface_record(interface.id, platform=adapter.platform)
+        handle = await adapter._handle(interface.id)
+        assert handle.ttl == 3600
+        await app.close()
+
+    asyncio.run(scenario())

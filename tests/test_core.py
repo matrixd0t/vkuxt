@@ -1272,3 +1272,57 @@ def test_locked_state_loads_mutates_and_saves_atomically() -> None:
         await app.close()
 
     asyncio.run(scenario())
+
+
+def test_background_handlers_are_filtered_by_initial_state() -> None:
+    class StepState(StateNamespace):
+        step: Literal["step"] = "step"
+
+    async def scenario() -> None:
+        app = App()
+        adapter = app.add_adapter(Adapter(app))
+        metadata = EchoMetadata(user_id=10)
+        events: list[str] = []
+
+        @app.handler(background=False)
+        async def foreground(
+            ctx: Context[Adapter, None],
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            events.append("foreground")
+            ctx.state = StepState()
+
+        @app.handler
+        async def background_new(
+            ctx: Context[Adapter, StepState],
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            # Наступление нового состояния foreground не должно вызывать
+            # хендлеры нового состояния в том же событии.
+            events.append("background_new")
+
+        @app.handler
+        async def background_empty(
+            ctx: Context[Adapter, None],
+            metadata: EchoMetadata,
+            data: None,
+            text: str,
+        ) -> None:
+            events.append("background_empty")
+
+        await app.dispatch_event(Input(metadata, text="start"), adapter)
+        await app.wait_background()
+        assert events == ["foreground"]
+        assert await app.get_state(adapter.context_key(metadata), StepState) == StepState()
+
+        # Следующее событие видит уже созданное состояние.
+        await app.dispatch_event(Input(metadata, text="next"), adapter)
+        await app.wait_background()
+        assert events == ["foreground", "background_new"]
+        await app.close()
+
+    asyncio.run(scenario())
