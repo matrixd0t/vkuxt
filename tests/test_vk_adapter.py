@@ -1093,3 +1093,73 @@ def test_missing_interface_handle_uses_app_default_ttl() -> None:
         await app.close()
 
     asyncio.run(scenario())
+
+
+def test_answer_callback_disabled_skips_answer() -> None:
+    async def scenario() -> None:
+        app = App(MemoryStorage())
+        vk = FakeVK()
+        adapter = add_vk_adapter(app, vk, answer_callback=False)
+        old = await adapter.send(5, VKInterface(text="prompt"))
+
+        @app.handler(background=False)
+        async def advance(
+            ctx: Context,
+            metadata: VKMessageMetadata,
+            data: InputData | None,
+            text: str,
+        ) -> None:
+            await ctx.redraw(VKInterface(text="replacement"))
+
+        metadata = VKMessageMetadata(
+            event_type="message_event",
+            group_id=71,
+            peer_id=5,
+            user_id=5,
+            event_id="event-no-answer",
+        )
+        metadata._interface_cmid = old.id.cmid
+        await adapter.dispatch_input(Input(metadata))
+
+        assert vk.messages.answers == []
+        # redraw без edit-attempt при allow_edit по умолчанию всё равно правит
+        assert vk.messages.edits != []
+        await app.close()
+
+    asyncio.run(scenario())
+
+
+def test_allow_edit_disabled_sends_new_without_edit_attempt() -> None:
+    async def scenario() -> None:
+        app = App(MemoryStorage())
+        vk = FakeVK()
+        adapter = add_vk_adapter(app, vk, allow_edit=False, answer_callback=False)
+        old = await adapter.send(5, VKInterface(text="prompt"))
+
+        @app.handler(background=False)
+        async def advance(
+            ctx: Context,
+            metadata: VKMessageMetadata,
+            data: InputData | None,
+            text: str,
+        ) -> None:
+            await ctx.redraw(VKInterface(text="replacement"))
+
+        metadata = VKMessageMetadata(
+            event_type="message_event",
+            group_id=71,
+            peer_id=5,
+            user_id=5,
+            event_id="event-no-edit",
+        )
+        metadata._interface_cmid = old.id.cmid
+        await adapter.dispatch_input(Input(metadata))
+
+        assert vk.messages.edits == []
+        assert len(vk.messages.sent) == 2
+        assert vk.messages.sent[-1]["message"] == "replacement"
+        assert vk.messages.answers == []
+        assert await adapter.edit(old, VKInterface(text="x")) is False
+        await app.close()
+
+    asyncio.run(scenario())

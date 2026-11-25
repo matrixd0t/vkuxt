@@ -237,9 +237,10 @@ class _VKAdapterBase(Adapter, ABC):
 class VKMessagesAdapter(_VKAdapterBase, ABC):
     """Абстракция операций VK Messages, общая для callback и long poll."""
 
-    def __init__(self, app: App, vk: VKClient, group_id: int) -> None:
+    def __init__(self, app: App, vk: VKClient, group_id: int, *, allow_edit: bool = True) -> None:
         _VKAdapterBase.__init__(self, app, group_id)
         self._vk = vk
+        self.allow_edit = allow_edit
 
     @property
     @abstractmethod
@@ -280,6 +281,8 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
         return handle
 
     async def edit(self, interface: VKMessageInterface, view: VKInterface) -> bool:
+        if not self.allow_edit:
+            return False
         return await self._edit_prepared(interface, view, self._prepare_view(view)) is not None
 
     async def delete(self, interface: VKMessageInterface) -> bool:
@@ -395,9 +398,13 @@ class VKMessagesAdapter(_VKAdapterBase, ABC):
             # считаем его текущим и заменяем после успешной отправки нового.
             result = await self._send_prepared(recipient, view, prepared)
             await self.delete(current)
-        elif current is not None and (
-            not same_event
-            or (context is not None and context.metadata.event_type == "message_event")
+        elif (
+            current is not None
+            and self.allow_edit
+            and (
+                not same_event
+                or (context is not None and context.metadata.event_type == "message_event")
+            )
         ):
             try:
                 result = await self._edit_prepared(current, view, prepared)
@@ -649,6 +656,7 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
         confirmation_code: str | None = None,
         secret: str | None = None,
         dm_latest_interface: bool = True,
+        answer_callback: bool = True,
     ) -> None:
         if callback_server is None:
             callback_server = CallbackServer(
@@ -660,6 +668,7 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
         self.callback_server = callback_server
         self.confirmation_code = confirmation_code
         self.dm_latest_interface = dm_latest_interface
+        self.answer_callback = answer_callback
 
         async def confirmation(
             ctx: Context,
@@ -873,6 +882,8 @@ class VKCallbackAdapter(_VKAdapterBase, ABC):
         *,
         safe: bool,
     ) -> None:
+        if not self.answer_callback:
+            return
         if (
             metadata.event_type != "message_event"
             or context.callback_changed
@@ -922,6 +933,8 @@ class VKMessagesCallbackAdapter(VKCallbackAdapter, VKMessagesAdapter):
         confirmation_code: str | None = None,
         secret: str | None = None,
         dm_latest_interface: bool = True,
+        answer_callback: bool = True,
+        allow_edit: bool = True,
     ) -> None:
         # Callback-инициализация создаёт общее состояние _VKAdapterBase;
         # второй __init__ из VKMessagesAdapter здесь не нужен.
@@ -933,8 +946,10 @@ class VKMessagesCallbackAdapter(VKCallbackAdapter, VKMessagesAdapter):
             confirmation_code=confirmation_code,
             secret=secret,
             dm_latest_interface=dm_latest_interface,
+            answer_callback=answer_callback,
         )
         self._vk = vk
+        self.allow_edit = allow_edit
 
     @property
     def vk(self) -> VKClient:

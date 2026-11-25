@@ -201,6 +201,14 @@ web = FastAPI(lifespan=app.lifespan)
 
 VK Callback адаптер использует `vkx.server.CallbackServer` для проверки входа и разбора уведомлений в модели `vkx`. Дедупликация доставленных событий — ответственность `vkx`: `CallbackServer` отбрасывает повторный `event_id` и повторную доставку `message_new` с той же парой `peer_id` + `conversation_message_id`. У `message_event` идентификатор лежит внутри `object.event_id`, поэтому адаптер дополнительно передаёт его в `CallbackServer.is_duplicate`. Текст приходит VK-хендлеру аргументом `text`; адаптер сам определяет, было ли сообщение ответом на сохранённый интерфейс. В личных диалогах можно включить определение последнего активного интерфейса; если обработчик затем вызывает `redraw()`, прежний интерфейс заменяется новым сообщением. Если foreground-хендлер не привёл к edit/delete именно нажатого интерфейса, адаптер отправляет `messages.sendMessageEventAnswer`. Индекс последних интерфейсов peer'а ограничен 10 записями и получает TTL интерфейса.
 
+Для клиента с пользовательским (не сообщество) токеном `messages.sendMessageEventAnswer` возвращает ошибку 27, а `messages.edit` групповых сообщений — ошибку 912: передавать `answer_callback=False` и `allow_edit=False` в адаптер, тогда ответ на callback и попытка правки пропускаются, `redraw()` сразу шлёт новое сообщение и не шумит в логах.
+
+```python
+adapter = app.add_adapter(
+    VKMessagesCallbackAdapter(app, vk, group_id=group_id, answer_callback=False, allow_edit=False)
+)
+```
+
 При fire-and-forget обработке `sendMessageEventAnswer` отправляется сразу после запуска фоновой задачи, не дожидаясь её завершения. Это укладывается в окно ответа VK; если нужен результат хендлера до ответа, используйте `background=False`, но держите такой путь коротким.
 
 Полный скетч крестиков-ноликов, включая лобби с кодом, ввод кода ответом на сообщение, две синхронизируемые доски и сдачу, находится в [`examples/tictactoe.py`](examples/tictactoe.py).
